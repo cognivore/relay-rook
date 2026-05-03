@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Relay Rook (Chessable Sync)",
+  "version": "0.1.0",
+  "description": "Sync chessable.com board positions to a robotic chess board via relay-rook.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "*://*.chess.localhost/*",
+    "*://*.chessable.com/*"
+  ],
+  "background": { "service_worker": "src/background.js" },
+  "content_scripts": [
+    {
+      "matches": ["*://*.chessable.com/*"],
+      "js": ["src/boardParser.js", "src/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html"
+  }
+}

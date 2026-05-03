@@ -1,0 +1,88 @@
+cabal-version:      3.0
+name:               relay-rook
+version:            0.1.0.0
+synopsis:           Bridge between Chessable web and a Chessnut Move robotic chess board.
+description:        Tagless-final bridge service. Pure programs in
+                    "RelayRook.Program" are constrained over MonadBoard /
+                    MonadStore / MonadClock and never see IO; concrete
+                    interpreters live in "RelayRook.Adapters". Future
+                    microservices share the SQLite database via
+                    versioned, content-hashed migrations.
+license:            MIT
+author:             cognivore
+maintainer:         relay-rook@example.invalid
+category:           Web
+build-type:         Simple
+
+common defaults
+    default-language:   Haskell2010
+    ghc-options:        -Wall
+                        -Wcompat
+                        -Wincomplete-record-updates
+                        -Wincomplete-uni-patterns
+                        -Wpartial-fields
+                        -Wredundant-constraints
+
+library
+    import:           defaults
+    hs-source-dirs:   src
+    exposed-modules:  RelayRook.Core
+                      RelayRook.Effects
+                      RelayRook.Program
+                      RelayRook.Schema
+                      RelayRook.Migrate
+                      RelayRook.Adapters
+                      RelayRook.Server
+                      RelayRook.Board.Protocol
+                      RelayRook.Board.Codec
+                      RelayRook.Board.Wire
+    build-depends:    base
+                    , aeson
+                    , base16-bytestring
+                    , base64-bytestring
+                    , beam-core
+                    , beam-migrate
+                    , beam-sqlite
+                    , bytestring
+                    , containers
+                    , cryptohash-sha256
+                    , direct-sqlite
+                    , directory
+                    , filepath
+                    , http-types
+                    , mtl
+                    , network
+                    , scotty
+                    , sqlite-simple
+                    , text
+                    , time
+                    , unix
+
+executable relay-rook
+    import:           defaults
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    build-depends:    base
+                    , relay-rook
+                    , beam-migrate
+                    , beam-sqlite
+                    , network
+                    , scotty
+                    , sqlite-simple
+                    , text
+
+test-suite relay-rook-test
+    import:           defaults
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Spec.hs
+    other-modules:    RelayRook.CoreSpec
+                      RelayRook.ProgramSpec
+    build-tool-depends: hspec-discover:hspec-discover
+    build-depends:    base
+                    , relay-rook
+                    , aeson
+                    , hspec
+                    , mtl
+                    , text
+                    , time
