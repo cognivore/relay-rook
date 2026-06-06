@@ -20,7 +20,7 @@ mod wire;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -53,6 +53,13 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Exactly one BLE daemon may run: two would each spin an auto-connect
+    // loop and fight over the single CoreBluetooth adapter, so the board
+    // ends up owned by whichever won the scan race — frequently not the
+    // instance the bridge is actually talking to over the socket. Newest
+    // wins, matching launchd's own `kickstart -k` semantics.
+    enforce_singleton(&args.socket).await;
+
     if args.socket.exists() {
         std::fs::remove_file(&args.socket)
             .with_context(|| format!("removing stale socket at {:?}", args.socket))?;
@@ -82,6 +89,73 @@ async fn main() -> Result<()> {
                 tracing::warn!(error=?e, "client disconnected with error");
             }
         });
+    }
+}
+
+/// Terminate any other live `relay-rook-ble` so this invocation is the
+/// sole owner of the BLE adapter. We track the running PID in a file
+/// next to the socket; on startup, if it names a still-running
+/// relay-rook-ble, we SIGTERM it and wait briefly for it to release
+/// CoreBluetooth before continuing. Then we record our own PID.
+///
+/// Done with `kill(1)` / `ps(1)` rather than libc so the crate keeps
+/// `#![forbid(unsafe_code)]`.
+async fn enforce_singleton(socket: &Path) {
+    let pidfile = socket.with_extension("pid");
+    let me = std::process::id();
+
+    if let Ok(contents) = std::fs::read_to_string(&pidfile) {
+        if let Ok(old_pid) = contents.trim().parse::<u32>() {
+            if old_pid != me && pid_is_relay_rook_ble(old_pid) {
+                tracing::warn!(
+                    old_pid,
+                    "another relay-rook-ble is running; terminating it so only one owns Bluetooth"
+                );
+                let _ = std::process::Command::new("kill")
+                    .arg(old_pid.to_string())
+                    .status();
+                // Wait up to ~3s for it to die and release the adapter.
+                for _ in 0..30 {
+                    if !pid_alive(old_pid) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    if let Some(dir) = pidfile.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    if let Err(e) = std::fs::write(&pidfile, me.to_string()) {
+        tracing::warn!(error=?e, "could not write pidfile {pidfile:?}");
+    }
+}
+
+/// True if `pid` is alive (`kill -0` succeeds).
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// True if `pid` is alive *and* its command line is a relay-rook-ble.
+/// Guards against PID reuse: a recycled PID belonging to some unrelated
+/// process must never be killed.
+fn pid_is_relay_rook_ble(pid: u32) -> bool {
+    match std::process::Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("command=")
+        .output()
+    {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains("relay-rook-ble"),
+        Err(_) => false,
     }
 }
 
@@ -221,9 +295,9 @@ async fn dispatch(op: Op, slot: &BleSlot) -> Event {
             Ok(items) => Event::ScanResult {
                 devices: items
                     .into_iter()
-                    .map(|(addr, name)| DeviceInfo {
-                        address: addr.to_string(),
-                        name,
+                    .map(|m| DeviceInfo {
+                        address: m.address,
+                        name: m.name,
                     })
                     .collect(),
             },

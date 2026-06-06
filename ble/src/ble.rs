@@ -8,13 +8,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use btleplug::api::{
-    BDAddr, Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
+    Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
     ScanFilter, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::StreamExt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
@@ -24,6 +24,16 @@ use crate::chessnut;
 pub enum Notification {
     Fen(Vec<u8>),
     Cmd(Vec<u8>),
+}
+
+/// A discovered Chessnut board. We keep the live `peripheral` handle so
+/// we can connect to it directly: on macOS CoreBluetooth hides MAC
+/// addresses (every peripheral reports `00:00:00:00:00:00`), so the
+/// address is useless for re-identifying a device — the handle is not.
+pub struct ScanMatch {
+    pub peripheral: Peripheral,
+    pub address: String,
+    pub name: Option<String>,
 }
 
 #[derive(Default)]
@@ -39,6 +49,11 @@ pub struct Ble {
     pub adapter: Adapter,
     pub state: Arc<Mutex<State>>,
     pub notifications: broadcast::Sender<Notification>,
+    /// Serializes BLE scans. Concurrent `start_scan`/`stop_scan` calls
+    /// (e.g. the auto-connect loop racing a client `Op::Scan`) corrupt
+    /// btleplug's CoreBluetooth backend — it logs "Event receiver died"
+    /// and the adapter goes dead until the process restarts.
+    scan_lock: Mutex<()>,
 }
 
 impl Ble {
@@ -67,29 +82,54 @@ impl Ble {
             adapter,
             state: Arc::new(Mutex::new(State::default())),
             notifications: tx,
+            scan_lock: Mutex::new(()),
         })
     }
 
-    /// Scan briefly and return everything that looks like a Chessnut
-    /// Move board.
-    pub async fn scan(&self, timeout: Duration) -> Result<Vec<(BDAddr, Option<String>)>> {
+    /// Scan for Chessnut Move boards, returning live peripheral handles.
+    ///
+    /// We poll `peripherals()` repeatedly during the window and return as
+    /// soon as a board appears, rather than sleeping the whole `timeout`
+    /// and reading once: on a cold adapter the device is frequently not
+    /// in the list until several advertising intervals in, which made the
+    /// old fixed-5s single read miss boards that were plainly present.
+    /// If nothing shows up we keep looking until `timeout` elapses.
+    pub async fn scan(&self, timeout: Duration) -> Result<Vec<ScanMatch>> {
+        let _scan_guard = self.scan_lock.lock().await;
         self.adapter.start_scan(ScanFilter::default()).await?;
-        tokio::time::sleep(timeout).await;
-        let peripherals = self.adapter.peripherals().await?;
+        let deadline = Instant::now() + timeout;
+        let matches = loop {
+            let found = self.matching_peripherals().await?;
+            if !found.is_empty() || Instant::now() >= deadline {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
         let _ = self.adapter.stop_scan().await;
+        Ok(matches)
+    }
+
+    /// One pass over the adapter's currently-known peripherals, keeping
+    /// those whose advertised name marks them as a Chessnut board.
+    async fn matching_peripherals(&self) -> Result<Vec<ScanMatch>> {
+        let peripherals = self.adapter.peripherals().await?;
         let mut out = Vec::new();
         for p in peripherals {
             let props = match p.properties().await? {
-                Some(p) => p,
+                Some(props) => props,
                 None => continue,
             };
-            if props
+            let is_chessnut = props
                 .local_name
                 .as_deref()
                 .map(|n| n.contains(chessnut::NAME_PREFIX))
-                .unwrap_or(false)
-            {
-                out.push((p.address(), props.local_name));
+                .unwrap_or(false);
+            if is_chessnut {
+                out.push(ScanMatch {
+                    address: p.address().to_string(),
+                    name: props.local_name,
+                    peripheral: p,
+                });
             }
         }
         Ok(out)
@@ -106,21 +146,25 @@ impl Ble {
             }
         }
 
-        let candidates = self.scan(Duration::from_secs(5)).await?;
+        let candidates = self.scan(Duration::from_secs(10)).await?;
         let chosen = match address_filter {
             Some(filter) => candidates
                 .into_iter()
-                .find(|(addr, _)| addr.to_string().eq_ignore_ascii_case(&filter)),
+                .find(|m| m.address.eq_ignore_ascii_case(&filter)),
             None => candidates.into_iter().next(),
         }
         .ok_or_else(|| anyhow!("no Chessnut Move board found"))?;
 
-        let (addr, name) = chosen;
-        let peripherals = self.adapter.peripherals().await?;
-        let peripheral = peripherals
-            .into_iter()
-            .find(|p| p.address() == addr)
-            .ok_or_else(|| anyhow!("peripheral {addr} disappeared between scan and connect"))?;
+        // Connect to the scanned handle directly — do NOT re-fetch and
+        // match by address. On macOS every peripheral's address is
+        // 00:00:00:00:00:00, so an address match would grab an arbitrary
+        // device. The bleak reference keeps the scanned handle for the
+        // same reason.
+        let ScanMatch {
+            peripheral,
+            address: addr,
+            name,
+        } = chosen;
 
         peripheral.connect().await.context("BLE connect")?;
         peripheral
