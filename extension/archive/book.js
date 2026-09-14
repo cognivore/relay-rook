@@ -77,6 +77,13 @@ const Book = (() => {
     return url.origin + '/';
   }
   const safeName = value => text(value).replace(/[\x00-\x1f\x7f/\\:*?"<>|]/g, '_').slice(0,100).replace(/[. ]+$/g,'') || 'Book';
+  function volumeName(title, lessons, part, total) {
+    const first=lessons[0]?.chapterOrder, last=lessons.at(-1)?.chapterOrder;
+    if (!text(title) || ![first,last,part,total].every(n=>Number.isSafeInteger(n) && n>0) || first>last || part>total) throw Error('Cannot name a volume without its course and chapter range.');
+    const width=Math.max(2,String(total).length);
+    const suffix=` · Vol ${String(part).padStart(width,'0')}/${String(total).padStart(width,'0')} · Ch ${first}${first===last?'':'–'+last}`;
+    return text(title).slice(0,100-suffix.length).trimEnd()+suffix;
+  }
   const escape = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   function html(course, lessons) {
     return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escape(course.title)}</title><style>body{max-width:850px;margin:40px auto;padding:0 24px;font:18px/1.65 system-ui;background:#faf8f3;color:#242424}a{color:#254d76}article{border-top:1px solid #ccc;margin-top:40px;padding-top:20px}.comment{white-space:pre-wrap}.move{font-weight:bold}code{overflow-wrap:anywhere}nav a{display:block}</style><h1>${escape(course.title)}</h1><p>Archived from your Chessable library. Companion PGN files contain the positions and move trees.</p><nav>${lessons.map(l=>`<a href="#lesson-${l.id}">${escape(l.chapterOrder+'.'+l.order+' '+l.title)}</a>`).join('')}</nav>${lessons.map(l=>`<article id="lesson-${l.id}"><h2>${escape(l.chapter+' · '+l.title)}</h2><a href="${escape(l.url)}">Source lesson</a><p>Starting FEN: <code>${escape(l.initialFen)}</code></p>${l.tokens.map(t=>t.kind==='comment'?`<p class="comment">${escape(t.text)}</p>`:t.kind==='move'?`<span class="move">${escape(t.number+' '+t.san+t.annotation)} </span>`:escape(t.kind==='open'?' ( ':' ) ')).join('')}</article>`).join('')}`;
@@ -145,6 +152,6 @@ const Book = (() => {
     });
   }
   const permission = value => { const url=new URL(instance(value)); return `${url.protocol}//${url.hostname}/*`; };
-  return {text, fen, move, pgn, instance, permission, safeName, html, signature, forLichess};
+  return {text, fen, move, pgn, instance, permission, safeName, volumeName, html, signature, forLichess};
 })();
 if (typeof module !== 'undefined') module.exports = Book;

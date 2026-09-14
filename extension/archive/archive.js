@@ -45,7 +45,7 @@ async function render() {
       button.onclick=async()=>{try{if(title==='Create private studies')await access();await exclusive(action);}catch(e){issue(e.message);}};tr.lastChild.append(button);
     }
     for(const study of course.studies || []){
-      const a=document.createElement('a');a.href=study.url;a.target='_blank';a.rel='noopener';a.textContent=`Volume ${study.part}${study.verified?' ✓':' · needs verification'}`;
+      const a=document.createElement('a');a.href=study.url;a.target='_blank';a.rel='noopener';a.textContent=`${study.name || 'Volume '+study.part}${study.verified?' ✓':' · needs verification'}`;
       tr.lastChild.append(document.createElement('br'),a);
     }
     return tr;
@@ -97,7 +97,10 @@ async function download(filename,contents,type) {
 async function saveBook(course) {
   const lessons=await courseLessons(course), folder=`Relay Rook Books/${Book.safeName(course.title)} [${course.id}]`;
   stage(`Saving ${course.title} · ${lessons.length} lessons`);
-  for(let i=0;i<lessons.length;i+=64)await download(`${folder}/Book ${String(i/64+1).padStart(2,'0')}.pgn`,lessons.slice(i,i+64).map(Book.pgn).join('\n'),'application/x-chess-pgn');
+  for(let i=0;i<lessons.length;i+=64){
+    const volume=lessons.slice(i,i+64), name=Book.volumeName(course.title,volume,i/64+1,Math.ceil(lessons.length/64));
+    await download(`${folder}/${Book.safeName(name)}.pgn`,volume.map(Book.pgn).join('\n'),'application/x-chess-pgn');
+  }
   await download(`${folder}/Book.html`,Book.html(course,lessons),'text/html');
   await download(`${folder}/Source.json`,JSON.stringify({course,lessons},null,2),'application/json');
   course.downloaded=new Date().toISOString();await record(`course:${course.id}`,course);
@@ -123,12 +126,13 @@ async function importBook(course) {
   course.studies ||= [];
   for(let i=0;i<lessons.length;i+=64){
     if(stopping)throw Error('Upload stopped. Saved books and completed studies are retained.');
-    const part=i/64+1, pgn=lessons.slice(i,i+64).map(Book.pgn).join('\n');
+    const part=i/64+1, volume=lessons.slice(i,i+64), pgn=volume.map(Book.pgn).join('\n');
+    const name=Book.volumeName(course.title,volume,part,Math.ceil(lessons.length/64));
     const sourceHash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(pgn)))].map(b=>b.toString(16).padStart(2,'0')).join('');
     let saved=course.studies.find(s=>s.instance===instance && s.part===part);
     if(saved?.sourceHash && saved.sourceHash!==sourceHash)throw Error(`Volume ${part}'s source changed. Inspect ${saved.url} before replacing existing study content.`);
-    if(saved?.verified){log(`Volume ${part} already verified at ${saved.url}`);continue;}
-    stage(`Creating private study · ${course.title} · volume ${part}`);
+    if(saved?.verified && saved.name===name){log(`${name} already verified at ${saved.url}`);continue;}
+    stage(`${saved?'Updating':'Creating'} private study · ${name}`);
     const tab=await chrome.tabs.create({url:saved?.url || instance+'study',active:false});studyTabId=tab.id;
     await waitTab(studyTabId,u=>u.origin===origin && u.pathname.startsWith('/study'));
     if(!saved){
@@ -138,10 +142,9 @@ async function importBook(course) {
       saved={instance,part,id,url:instance+'study/'+id,verified:false,sourceHash};course.studies.push(saved);
       await record(`course:${course.id}`,course);
     }
-    if(!saved.configured){
-      const suffix=` · Book ${part}`;
-      await step('configure',{origin,name:course.title.slice(0,100-suffix.length)+suffix});
-      saved.configured=true;await record(`course:${course.id}`,course);
+    if(!saved.configured || saved.name!==name){
+      await step('configure',{origin,name});
+      saved.configured=true;saved.name=name;await record(`course:${course.id}`,course);
     }
     await step('privacy',{origin});
     if(!saved.attempted){
