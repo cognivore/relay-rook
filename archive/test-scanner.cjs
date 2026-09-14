@@ -5,36 +5,42 @@ const vm = require('node:vm');
 const path = require('node:path');
 const Book = require('../extension/archive/book.js');
 const source = fs.readFileSync(path.join(__dirname, '../extension/src/archive-scan.js'), 'utf8');
+const contentSource = fs.readFileSync(path.join(__dirname, '../extension/src/content.js'), 'utf8');
 const origin = 'https://www.chessable.com';
 function anchor(href, text, video = false) {
   return { href: origin + href, textContent: text, firstElementChild: { textContent: text },
     querySelector: selector => selector.startsWith('.title') ? { textContent: text } : video ? {} : null };
 }
-function fixture(pathname, selectors = {}) {
-  let handler, observer;
+function fixture(pathname, selectors = {}, hash = '#relay-rook-archive=test') {
+  let observer;
+  const handlers=[], pageEvents={}, sent=[];
   const timers = new Set();
   const lookup = selector => typeof selectors[selector] === 'function' ? selectors[selector]() : selectors[selector];
-  const context = { URL, Map, Set, Error, Book, location: { origin, pathname, hash: '#relay-rook-archive=test' },
+  class MouseEvent {constructor(type, options) {this.type=type;Object.assign(this,options);}}
+  const context = { URL, Map, Set, Error, Book, MouseEvent, PointerEvent:MouseEvent, location: { origin, pathname, hash },
     setTimeout: (fn, ms) => {
       const timer={ms}; timers.add(timer);
       (ms===8000 ? setImmediate : queueMicrotask)(()=>{if(timers.delete(timer))fn();});
       return timer;
     },
     clearTimeout: timer => timers.delete(timer),
+    setInterval: () => {},
     MutationObserver: class {
       constructor(callback) {this.callback=callback;observer=this;}
       observe() {this.connected=true;}
       disconnect() {this.connected=false;}
     },
     window: { scrollTo() {} },
-    document: { body: { scrollHeight: 100 }, querySelector: selector => lookup(selector) || (selector.startsWith('a.bookTitle,') ? {} : null),
+    document: {readyState:'loading',addEventListener:(name,fn)=>{pageEvents[name]=fn;},body: { scrollHeight: 100 }, querySelector: selector => lookup(selector) || (selector.startsWith('a.bookTitle,') ? {} : null),
       querySelectorAll: selector => lookup(selector) || [] },
-    chrome: { runtime: { onMessage: { addListener: fn => { handler = fn; } } } } };
-  vm.runInNewContext(source, context);
-  return { context, scan: (mode, lesson) => new Promise(resolve => handler({ type: 'ARCHIVE_SCAN', mode, lesson }, {}, resolve)),
+    chrome: { runtime: {sendMessage:msg=>{sent.push(msg);return Promise.resolve();}, onMessage: { addListener: fn => {handlers.push(fn);} } } } };
+  vm.createContext(context);
+  vm.runInContext(source, context);
+  vm.runInContext(contentSource, context);
+  return { context, sent, pageEvents, bridge:handlers[1], scan: (mode, lesson) => new Promise(resolve => handlers[0]({ type: 'ARCHIVE_SCAN', mode, lesson, token:hash }, {}, resolve)),
     mutate: () => {if(observer?.connected)observer.callback();},
     observing: () => observer?.connected,
-    handler: (...args) => handler(...args) };
+    handler: (...args) => handlers[0](...args) };
 }
 // Shapes from the signed-in /variation/48641668/ HTML: commentary, a null
 // placeholder, two backward controls, selected move and the readonly FEN input.
@@ -46,7 +52,15 @@ function lessonFixture(onRewind) {
   const comment={nodeType:1,tagName:'SPAN',innerHTML:'Exact introduction.',
     matches:s=>s==='.commentInVariation',childNodes:[{nodeType:3,textContent:'Exact introduction.'}]};
   const root={childNodes:[comment,move],querySelectorAll:()=>[move]};
-  const state={rewind:{disabled:false,click(){onRewind(state,page);}},previous:{disabled:false},selected:move,input:{value:after}};
+  const state={events:[],rewind:{disabled:false,
+    click(){assert.fail('Chessable rewind does not handle click; it handles mousedown.');},
+    getBoundingClientRect:()=>({left:0,top:0,width:40,height:40}),
+    dispatchEvent(event){
+      state.events.push(event.type);
+      if(event.type==='mousedown' && event.bubbles && event.button===0)onRewind(state,page);
+      return true;
+    }
+  },previous:{disabled:false},selected:move,input:{value:after}};
   const page=fixture('/variation/42/',{
     'a[href]':[anchor('/course/258968/1/?o=42','1. Introduction')],
     '.board-btns__btn .fa-fast-backward':()=>({closest:()=>state.rewind}),
@@ -89,7 +103,16 @@ function lessonFixture(onRewind) {
   assert.equal(courses.courses.length, 2);
   assert.equal(trigger.textContent, 'Active', 'Restore the original library filter');
   library.context.location.hash = '';
-  assert.equal(library.handler({ type: 'ARCHIVE_SCAN', mode: 'library' }, {}, () => {}), false);
+  assert.equal((await library.scan('library')).ok,true,'Keep the scan identity after Chessable rewrites the hash');
+  library.pageEvents.DOMContentLoaded();
+  library.bridge({type:'RECONNECT'},{},()=>assert.fail('Do not connect a scan tab to the physical board'));
+  assert.equal(library.sent.length,0,'Hash rewriting must not enable board sync');
+  const normal=fixture('/',{},'');
+  normal.context.location.hash='#relay-rook-archive=late';
+  assert.equal(normal.handler({type:'ARCHIVE_SCAN',mode:'library',token:normal.context.location.hash},{},()=>{}),false,'Normal tabs cannot become scan tabs after loading');
+  let mismatch;
+  library.handler({type:'ARCHIVE_SCAN',token:'#relay-rook-archive=another',mode:'library'},{},response=>{mismatch=response;});
+  assert.equal(mismatch.ok,false,'Reject a request intended for another scan page');
   const missing = await fixture('/course/123333').scan('chapters');
   assert.equal(missing.ok, false, 'Never report an empty/inaccessible course as scanned');
   const replaced=lessonFixture((state,page)=>queueMicrotask(()=>{
@@ -102,6 +125,7 @@ function lessonFixture(onRewind) {
   assert.equal(saved.ok,true,saved.error);
   assert.equal(oldButton.disabled,false,'The detached control never changes');
   assert.equal(saved.lesson.initialFen,replaced.initial,'Wait for the starting FEN too');
+  assert.deepEqual(replaced.state.events,['pointerdown','mousedown','pointerup','mouseup','click'],'Exercise the actual shared event helper');
   assert.equal(saved.lesson.tokens[0].text,'Exact introduction.');
   assert.match(saved.lesson.pgn,/\[ChapterName "1.1 Aim of the Course"\]/);
   assert.equal(replaced.page.observing(),false,'Disconnect after success');

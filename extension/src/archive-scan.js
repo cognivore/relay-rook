@@ -1,5 +1,8 @@
 "use strict";
 
+// Capture at document_start: Chessable replaces the hash after loading a lesson.
+const relayRookArchiveToken = location.hash.startsWith('#relay-rook-archive=') ? location.hash : null;
+
 // Read the same rendered library/chapters the signed-in user can browse.
 // Never starts video playback or a MoveTrainer session.
 (() => {
@@ -142,7 +145,9 @@
         `Rewind did not settle within 8 seconds (rewind disabled: ${control('fa-fast-backward')?.disabled}, previous disabled: ${control('fa-chevron-left')?.disabled}, FEN: ${document.querySelector('#inputFEN')?.value || 'missing'}). The lesson was not saved.`
       )), 8000);
       observer.observe(document.body, {subtree:true, childList:true, attributes:true, attributeFilter:['disabled','value','class']});
-      if (!rewind.disabled) rewind.click();
+      // Chessable binds rewind to mousedown/touchstart, not click. Reuse the
+      // board-sync helper, which dispatches the complete mouse event sequence.
+      if (!rewind.disabled) simulateClick(rewind);
       check();
     });
   }
@@ -194,7 +199,11 @@
     return { lesson:result };
   }
   chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
-    if (msg.type !== 'ARCHIVE_SCAN' || !location.hash.startsWith('#relay-rook-archive=')) return false;
+    if (msg.type !== 'ARCHIVE_SCAN' || !relayRookArchiveToken) return false;
+    if (msg.token !== relayRookArchiveToken) {
+      respond({ok:false,error:'The scanner page changed before this request. The lesson was not saved.'});
+      return false;
+    }
     (async () => {
       await ready();
       if (msg.mode === 'library' && location.pathname === '/') return library();

@@ -126,6 +126,7 @@ function playMoveOnBoard(from, to) {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (relayRookArchiveToken) return false;
   if (msg.type === "PHYSICAL_FEN" && lastFen) {
     const move = fenDiff(lastFen, msg.placement);
     if (move) playMoveOnBoard(move.from, move.to);
@@ -151,7 +152,7 @@ setInterval(() => {
 
 function init() {
   // Book scans read lesson positions without moving the physical board.
-  if (location.hash.startsWith("#relay-rook-archive=")) return;
+  if (relayRookArchiveToken) return;
   tryAttach();
   watchForBoard();
   chrome.runtime.sendMessage({ type: "CONTENT_READY" });

@@ -66,8 +66,8 @@ async function scanPage(url,mode,lesson) {
   target.hash=`relay-rook-archive=${crypto.randomUUID()}`;
   if(scannerId===null)scannerId=(await chrome.tabs.create({url:target.href,active:false})).id;
   else await chrome.tabs.update(scannerId,{url:target.href});
-  await waitTab(scannerId,u=>u.origin===target.origin && u.pathname.replace(/\/$/,'')===target.pathname.replace(/\/$/,'') && u.search===target.search && u.hash===target.hash);
-  const result=await chrome.tabs.sendMessage(scannerId,{type:'ARCHIVE_SCAN',mode,lesson});
+  await waitTab(scannerId,u=>u.origin===target.origin && u.pathname.replace(/\/$/,'')===target.pathname.replace(/\/$/,'') && u.search===target.search);
+  const result=await chrome.tabs.sendMessage(scannerId,{type:'ARCHIVE_SCAN',mode,lesson,token:target.hash});
   if(!result?.ok)throw Error(result?.error || 'Book scanner did not respond. Reload Relay Rook and start again.');
   return result;
 }
