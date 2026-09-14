@@ -62,3 +62,11 @@ reconnectBtn.addEventListener("click", () => {
 
 fetchState();
 setInterval(fetchState, 2000);
+
+$("archive-btn").addEventListener("click", async () => {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const course = tab?.url?.match(/^https:\/\/www\.chessable\.com\/course\/(\d+)/)?.[1];
+  const url = chrome.runtime.getURL("archive/archive.html") + (course ? `?course=${course}` : '');
+  await chrome.tabs.create({ url });
+  window.close();
+});

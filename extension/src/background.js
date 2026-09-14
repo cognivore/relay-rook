@@ -1,4 +1,5 @@
 "use strict";
+importScripts("archive-capture.js");
 
 // Relay-rook server endpoints. The server owns rollback detection now;
 // we use its `rollback` flag to lock the physical board until it complies.
@@ -103,6 +104,8 @@ async function pollPhysical() {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type?.startsWith("ARCHIVE_")) return false;
+  if (sender.tab?.url?.includes("#relay-rook-archive=")) return false;
   if (sender.tab) chessableTabId = sender.tab.id;
 
   if (!state.enabled && msg.type !== "GET_STATE" && msg.type !== "SET_CONFIG") {

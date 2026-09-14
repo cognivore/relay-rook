@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Relay Rook · Course archive</title>
+<style>
+body { max-width: 960px; margin: 40px auto; padding: 0 24px; font: 15px/1.6 system-ui; color: #222; background: #fafafa; }
+h1 { font-size: 28px; } button { padding: 10px 16px; margin: 4px 8px 4px 0; cursor: pointer; border: 1px solid #bbb; border-radius: 6px; }
+button:first-child { background: #1a1a2e; color: white; } button:disabled { opacity: .5; cursor: default; }
+#status { padding: 14px; background: #eee; border-radius: 6px; } td,th { padding: 9px; text-align: left; border-bottom: 1px solid #ddd; }
+table { width: 100%; border-collapse: collapse; } code { overflow-wrap: anywhere; } .error { color: #a21c19; }
+pre.log { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; padding: 14px; background: #eee; border-radius: 6px; font: 13px/1.5 ui-monospace, monospace; }
+td button { display: block; padding: 4px 10px; } h2 { font-size: 19px; }
+</style>
+<h1>Course archive</h1>
+<p>Save your Chessable library’s available videos in course and chapter order. Keep this tab and the helper open. Each video is captured from its authenticated page and downloaded before the scan continues.</p>
+<div>
+<button id="start">Archive all courses</button><button id="stop" disabled>Stop scanning</button>
+<button id="pause">Pause after current video</button><button id="retry">Retry failed downloads</button>
+<button id="report">Save scan report</button>
+</div>
+<p id="status" role="status" aria-live="polite">Connecting to the local archive helper…</p>
+<p id="scan" role="status" aria-live="polite"></p>
+<p id="folder"></p>
+<p id="widevine"></p>
+<p><a href="openwv.html">OpenWV setup for Chrome on macOS</a></p>
+<div id="setup" hidden>
+<p>Start the archive helper once, then return here:</p>
+<pre><code>cd ~/Github/relay-rook
+nix run .#archive</code></pre>
+<p>Nix supplies the pinned Python, yt-dlp and FFmpeg dependencies.</p>
+</div>
+<table><thead><tr><th>Course / chapter</th><th>Video</th><th>Status</th></tr></thead><tbody id="jobs"></tbody></table>
+<h2>Activity log</h2>
+<p>Scan steps and failures appear here as they happen and survive reloading this tab.</p>
+<pre id="activity" class="log" role="log" aria-live="polite">No scan activity yet.</pre>
+<h2 id="download-title">Download log</h2>
+<pre id="download-log" class="log">Select “View log” beside a video. Download progress refreshes automatically.</pre>
+<script src="archive.js"></script>
+</html>

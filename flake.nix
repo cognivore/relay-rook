@@ -3,21 +3,42 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    archive-nixpkgs.url = "github:NixOS/nixpkgs/02f5696b0e6097e589076d886b317b83ff0437d7";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, archive-nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        archivePkgs = archive-nixpkgs.legacyPackages.${system};
+        archivePython = archivePkgs.python3.withPackages (ps: [ ps.pywidevine ]);
+        archiveTools = [
+          archivePython
+          archivePkgs.yt-dlp archivePkgs.ffmpeg archivePkgs.bento4
+        ];
       in
       {
         packages = {
           relay-rook     = pkgs.callPackage ./nix/package.nix { };
           relay-rook-ble = pkgs.callPackage ./nix/ble.nix { };
+          archive = pkgs.writeShellApplication {
+            name = "relay-rook-archive";
+            runtimeInputs = archiveTools;
+            text = ''
+              exec python3 ${./archive}/server.py --extension "$PWD/extension" "$@"
+            '';
+          };
           default        = self.packages.${system}.relay-rook;
         };
 
+        devShells.archive = archivePkgs.mkShell { packages = archiveTools ++ [ pkgs.nodejs ]; };
+        devShells.openwv = pkgs.mkShell {
+          nativeBuildInputs = [
+            archivePython pkgs.git pkgs.cargo pkgs.rustc pkgs.clang
+            pkgs.rustPlatform.bindgenHook
+          ];
+        };
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
             pkgs.haskell.compiler.ghc984Binary
@@ -46,6 +67,10 @@
         apps.default = {
           type = "app";
           program = "${self.packages.${system}.relay-rook}/bin/relay-rook";
+        };
+        apps.archive = {
+          type = "app";
+          program = "${self.packages.${system}.archive}/bin/relay-rook-archive";
         };
         apps.relay-rook-ble = {
           type = "app";

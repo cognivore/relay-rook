@@ -1,20 +1,28 @@
 {
   "manifest_version": 3,
   "name": "Relay Rook (Chessable Sync)",
-  "version": "0.1.0",
-  "description": "Sync chessable.com board positions to a robotic chess board via relay-rook.",
-  "permissions": ["storage"],
+  "version": "0.3.0",
+  "description": "Sync Chessable to a Chessnut board and archive your course videos for offline viewing.",
+  "permissions": ["storage", "webRequest"],
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*",
     "*://*.chess.localhost/*",
-    "*://*.chessable.com/*"
+    "*://*.chessable.com/*",
+    "https://player.vimeo.com/*",
+    "https://*.vimeocdn.com/*"
   ],
   "background": { "service_worker": "src/background.js" },
   "content_scripts": [
     {
       "matches": ["*://*.chessable.com/*"],
-      "js": ["src/boardParser.js", "src/content.js"],
+      "js": ["src/archive-scan.js", "src/boardParser.js", "src/content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://player.vimeo.com/video/*"],
+      "js": ["src/archive-player.js"],
+      "all_frames": true,
       "run_at": "document_idle"
     }
   ],

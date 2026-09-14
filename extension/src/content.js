@@ -150,6 +150,8 @@ setInterval(() => {
 }, 20000);
 
 function init() {
+  // The archive visits lessons only to read their video embeds. Never move the board.
+  if (location.hash.startsWith("#relay-rook-archive=")) return;
   tryAttach();
   watchForBoard();
   chrome.runtime.sendMessage({ type: "CONTENT_READY" });

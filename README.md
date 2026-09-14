@@ -209,3 +209,131 @@ The pure/impure split inside the Haskell tree is the same as before:
 touch the OS. Tests in `test/RelayRook/ProgramSpec.hs` import no
 adapters and use mock instances of all three port classes — so the
 suite proves the architectural claim, not just the behaviour.
+
+## Offline course video archive
+
+Start the archive helper from this checkout with Nix:
+
+```sh
+nix run .#archive
+# Choose another disk if desired:
+nix run .#archive -- --root /Volumes/MyDisk/Chessable
+```
+
+Open the course you want first, then click Relay Rook → **Archive all courses**.
+On the archive page, start the scan. It enumerates the signed-in library's **All**
+view, prioritizes the course you opened, then visits each chapter in order.
+For each video it starts muted playback in its scan tab, captures the actual
+Vimeo CDN manifest and license request context, pauses once playback starts, and sends that stream
+to the local helper. It waits for the download result before visiting the next
+chapter. The scan does not synchronize its positions to your Chessnut board.
+
+The helper uses Nix-provided Python, pywidevine, yt-dlp, Bento4 and FFmpeg. Its dependencies are
+pinned separately from the existing board bridge toolchain in `flake.lock`.
+There are no alternate installers, anonymous video URL resolvers, or automatic
+format fallbacks. The clear-stream format is `bv+ba`; absent streams, unsupported
+manifest types, failed authentication and incomplete downloads fail explicitly.
+Network/fragment retries and the durable per-video queue provide fault tolerance.
+A failed chapter appears immediately in the **Activity log** and the saved report
+while the remaining chapters continue. The log survives reloading the archive tab.
+Use **View log** beside a video for the downloader's recent output and progress;
+signed URLs and request credentials are redacted from that view.
+
+Widevine MPD streams require a valid local device provision (`.wvd`) accepted by
+the provider and its public service certificate observed in the player's EME
+`setServerCertificate` call. An EME log supplies PSSH, key IDs and encrypted license
+messages, **not plaintext content keys or a device provision**. Relay Rook cannot
+generate a Google-provisioned device file. Start with explicit private file paths:
+
+```sh
+nix run .#archive -- --device /private/path/device.wvd --certificate /private/path/service-certificate.bin
+```
+
+Defaults are `.relay-rook/device.wvd` and `.relay-rook/service-certificate.bin` in
+the archive folder. Keep the device file outside the repository/Nix store with
+permissions `600`. No keys or provision files belong in Git or the Nix closure.
+
+The helper parses the captured MPD, loads the local provision and public provider
+certificate, and sends a new privacy-mode challenge to the **exact captured Vimeo
+license endpoint**. It supports raw binary Widevine requests/responses; a wrapped
+JSON protocol requires an explicit adapter and fails visibly. Redirects are
+rejected, and credentials are never sent to a third-party key service. The browser's
+original challenge/response is not retained or replayed as the helper's license.
+
+Only after obtaining every required content key does it download the separate
+encrypted tracks, decrypt using Bento4, merge them, and decode the full result to
+check audio/video integrity. A bad key never produces a completed archive entry.
+Keys remain in helper memory and are passed to the local Bento4 process; they are
+not persisted in queue state or logs. Missing provisions/certificates and rejected
+licenses stop before downloading encrypted media. The queue continues other jobs.
+
+After updating, reload Relay Rook at `chrome://extensions`. This version adds
+`webRequest` and access to the Vimeo player/CDN for passive observation. Capture
+is restricted to disposable scan tabs explicitly armed by the archive page.
+It does not collect cookies from other sites or inspect ordinary browsing tabs.
+The helper listens on `127.0.0.1:8675` and requires a random local access token.
+The generated `extension/archive/local-config.json` is ignored by Git: do not
+commit it or use a `path:` flake containing it. Stream URLs and headers stay in
+private local queue metadata. Any observed CDN cookies are supplied through a
+short-lived cookie file scoped to the exact CDN host, not a global HTTP header.
+
+Keep the archive tab and helper open while scanning/downloading. Rescanning
+refreshes expired stream URLs and does not duplicate completed videos. Missing
+completed files are queued again. **Stop scanning** retains queued work;
+**Pause after current video** finishes the current file and stops the download
+queue. **Retry failed downloads** repeats the same captured request; rescan the
+course when the signed URL or authentication has expired. Restarting the helper
+resumes pending jobs. Closing Chrome mid-scan requires a new scan.
+Jobs saved before browser-stream capture was introduced are marked **need a fresh
+scan**. Retry cannot run these incomplete jobs; a new scan captures their request.
+
+Default output is `~/Movies/Relay Rook/`:
+
+```text
+Course title [course ID]/
+  003 - Chapter title [chapter ID]/
+    01 - Video title [Vimeo ID].mp4
+```
+
+The helper merges the chosen audio/video tracks with FFmpeg. It preserves partial
+files, never overwrites completed videos and aborts on missing fragments. Queue
+state, output paths and logs live in the private `.relay-rook/` directory within
+the archive. Keep that directory and use the same `--root` when restarting.
+
+Check both the download table and **Save scan report** before going offline.
+A completed scan is not a claim that every video was saved. The report records
+chapters with no accessible video player and any capture/download failure. The
+scanner uses the rendered Chessable chapter markup, so a site redesign must fail
+visibly and may require an update. This archives videos, not MoveTrainer.
+
+Checks:
+
+```sh
+nix develop .#archive -c python3 -m unittest discover -s archive -p 'test_*.py'
+nix develop .#archive -c node archive/test-scanner.cjs
+nix develop .#archive -c node archive/test-capture.cjs
+nix develop .#archive -c node archive/test-controller.cjs
+```
+
+Browser capture has been verified against course 258968's protected MPD streams.
+The local download path and CENC decryption/merge/full-decode path have been checked
+with generated test media, including rejection of a wrong key. A real course license
+has not been acquired: a usable device provision remains required. These local
+checks do not establish a successful course archive.
+
+References: [Chrome webRequest](https://developer.chrome.com/docs/extensions/reference/api/webRequest),
+[yt-dlp](https://github.com/yt-dlp/yt-dlp#usage-and-options).
+
+### OpenWV setup
+
+The archive page links to **OpenWV setup for Chrome on macOS**, including the
+device prerequisite, private build command, Chrome directory layout and rollback.
+OpenWV requires a device provision too; installing it does not supply one or
+automatically provide keys to the separate archive helper.
+
+`nix develop .#openwv -c bash archive/build-openwv.sh /private/device.wvd /private/new-build-dir`
+prepares the pinned upstream source and builds outside the Nix store. Nix supplies
+the toolchain; Cargo uses the upstream lockfile. The script refuses missing or
+invalid device files, shared device permissions and existing build directories.
+It produces a private Chrome package without changing the installed browser.
+No complete OpenWV build has been verified here because no provision was supplied.

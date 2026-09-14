@@ -23,3 +23,6 @@ result-*
 attic/python-prototype/.venv/
 attic/python-prototype/.pytest_cache/
 attic/**/__pycache__/
+archive/__pycache__/
+archive/.venv/
+extension/archive/local-config.json
