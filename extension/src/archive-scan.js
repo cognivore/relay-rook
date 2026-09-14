@@ -1,7 +1,7 @@
 "use strict";
 
 // Read the same rendered library/chapters the signed-in user can browse.
-// No private API, cookie export, playback, or MoveTrainer interaction.
+// Never starts video playback or a MoveTrainer session.
 (() => {
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
   const visible = el => !!el.getClientRects().length;
@@ -12,8 +12,8 @@
   };
   async function ready() {
     for (let n = 0; n < 40; n++) {
-      if (document.querySelector('input[type="password"]')) throw Error("Sign in to Chessable, then retry the scan.");
-      if (document.querySelector('a.bookTitle, h1.courseUI-bookChapter, [data-testid="filter-by-trigger"]')) {
+      if ([...document.querySelectorAll('input[type="password"]')].some(visible)) throw Error("Sign in to Chessable, then retry the scan.");
+      if (document.querySelector('a.bookTitle, h1.courseUI-bookChapter, [data-testid="filter-by-trigger"], [data-san]')) {
         await pause(1500);
         return;
       }
@@ -75,25 +75,96 @@
       id: new URL(a.href).pathname.split('/')[3], url: a.href,
       order: index + 1,
       title: clean(a.querySelector('.title')?.textContent),
-      hasVideo: /\uf03d/.test(a.textContent) || !!a.querySelector('.fa-video, .fa-video-camera'),
     }));
     if (chapters.some(c => !c.title)) throw Error('A chapter title is missing; scan stopped.');
     if (!chapters.length) throw Error("No chapter links found; check course access in the scan tab.");
     return { chapters };
   }
-  async function videos() {
-    // Some chapters contain several embeds. Wait for lazy players to mount.
-    window.scrollTo(0, document.body.scrollHeight);
-    await pause(1500);
-    const videos = new Map();
-    document.querySelectorAll('iframe[src]').forEach(el => {
-      const url = new URL(el.src);
-      if (url.origin !== 'https://player.vimeo.com' || !/^\/video\/\d+\/?$/.test(url.pathname)) return;
-      url.hash = '';
-      if (!clean(el.title)) throw Error('Video title is missing; scan stopped.');
-      videos.set(url.pathname, { url: url.href, title: clean(el.title) });
-    });
-    return { videos: [...videos.values()] };
+  async function lessons() {
+    const filter = document.querySelector('label[title="Filter by video"] input');
+    const previous = filter?.checked;
+    try {
+      if (previous) { filter.click(); await pause(500); }
+      const seen = new Set(), lessons = [];
+      for (const a of document.querySelectorAll('a[href]')) {
+        const url = new URL(a.href);
+        const match = url.pathname.match(/^\/variation\/(\d+)\/?$/);
+        if (url.origin !== location.origin || !match || seen.has(match[1])) continue;
+        const title = clean(a.textContent);
+        if (!title || title === 'Click Here For Problem Solution') continue;
+        seen.add(match[1]);
+        lessons.push({ id: match[1], title, order: lessons.length + 1, url: url.origin + url.pathname });
+      }
+      if (!lessons.length) throw Error('No book lessons found after clearing the video filter. This chapter needs review.');
+      return { lessons };
+    } finally { if (previous && !filter.checked) filter.click(); }
+  }
+  function readable(node) {
+    if (node.nodeType === 3) return node.textContent;
+    if (node.nodeType !== 1) return '';
+    if (node.matches('script,style')) return '';
+    if (node.tagName === 'BR') return '\n';
+    if (node.matches('[role="img"][data-piece]')) {
+      const symbols = {king:'♔',queen:'♕',rook:'♖',bishop:'♗',knight:'♘',pawn:'♙'};
+      return symbols[node.dataset.piece] || node.getAttribute('aria-label') || '';
+    }
+    if (node.tagName === 'IMG') return node.alt;
+    const body = [...node.childNodes].map(readable).join('');
+    return /^(P|DIV|LI|UL|OL)$/.test(node.tagName) ? '\n' + body + '\n' : body;
+  }
+  async function lesson(meta) {
+    if (!meta || location.pathname.replace(/\/$/,'') !== `/variation/${meta.id}`) throw Error('Lesson identity mismatch.');
+    const breadcrumb = [...document.querySelectorAll('a[href]')].some(a => new URL(a.href).pathname.replace(/\/$/,'') === `/course/${meta.courseId}/${meta.chapterId}`);
+    if (!breadcrumb) throw Error('The lesson does not belong to the expected course chapter.');
+    const rewind = document.querySelector('.board-btns__btn .fa-fast-backward')?.closest('button');
+    if (!rewind) throw Error('Cannot locate the starting-position control.');
+    if (!rewind.disabled) {
+      rewind.click();
+      for(let n=0;n<40 && !rewind.disabled;n++)await pause(50);
+      if(!rewind.disabled)throw Error('The board did not reach the starting position.');
+    }
+    const initialFen = Book.fen(document.querySelector('#inputFEN')?.value);
+    const root = document.querySelector('#theOpeningMoves');
+    if (!root) throw Error('The lesson move tree is missing.');
+    const tokens = [], comments = [];
+    let moves = 0;
+    function walk(node) {
+      if (node.nodeType === 3) {
+        const value = node.textContent.trim();
+        if (!value) return;
+        if (/^[()]+$/.test(value)) { for (const c of value) tokens.push({kind:c==='('?'open':'close'}); return; }
+        throw Error(`Unrecognized text outside the move commentary: ${value.slice(0,60)}`);
+      }
+      if (node.nodeType !== 1) return;
+      if (node.matches('.commentInVariation')) {
+        const value = Book.text(readable(node)).replace(/\n[ \t]+/g,'\n');
+        if (value) { tokens.push({kind:'comment', text:value}); comments.push(node.innerHTML); }
+        return;
+      }
+      if (node.matches('.commentSubvar')) {
+        tokens.push({kind:'open'});
+        for (const child of node.childNodes) walk(child);
+        tokens.push({kind:'close'}); return;
+      }
+      if (node.matches('[data-san]')) {
+        let san=node.dataset.san, number=node.dataset.move, annotation=clean(node.querySelector('.annotation')?.textContent);
+        if (node.matches('.subvariation-context-menu__trigger')) {
+          const value=readable(node).replace(/[♔♕♖♗♘♙]/g,c=>({'♔':'K','♕':'Q','♖':'R','♗':'B','♘':'N','♙':''}[c])).trim();
+          const match=value.match(/^(\d+\.(?:\.\.)?)\s*(\S+?)([!?]{0,2})$/);
+          if(!match || match[2].replace(/[+#]$/,'')!==san.replace(/[+#]$/,'')) throw Error('The displayed subvariation disagrees with its move data.');
+          [,number,san,annotation]=match;
+        }
+        tokens.push({kind:'move',san,number,fen:node.dataset.fen,annotation});
+        moves++; return;
+      }
+      if (node.matches('.openingNum')) return;
+      for (const child of node.childNodes) walk(child);
+    }
+    for (const child of root.childNodes) walk(child);
+    if (moves !== root.querySelectorAll('[data-san]').length) throw Error('Some moves were nested inside unsupported commentary markup. Refusing an incomplete export.');
+    const result = {...meta, initialFen, tokens, commentHtml:comments, captured:new Date().toISOString()};
+    result.pgn = Book.pgn(result);
+    return { lesson:result };
   }
   chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
     if (msg.type !== 'ARCHIVE_SCAN' || !location.hash.startsWith('#relay-rook-archive=')) return false;
@@ -101,7 +172,8 @@
       await ready();
       if (msg.mode === 'library' && location.pathname === '/') return library();
       if (msg.mode === 'chapters') return chapters();
-      if (msg.mode === 'videos') return videos();
+      if (msg.mode === 'lessons') return lessons();
+      if (msg.mode === 'lesson') return lesson(msg.lesson);
       throw Error('Invalid archive scan request.');
     })().then(data => respond({ ok: true, ...data }), error => respond({ ok: false, error: error.message }));
     return true;

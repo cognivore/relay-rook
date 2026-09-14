@@ -150,7 +150,7 @@ setInterval(() => {
 }, 20000);
 
 function init() {
-  // The archive visits lessons only to read their video embeds. Never move the board.
+  // Book scans read lesson positions without moving the physical board.
   if (location.hash.startsWith("#relay-rook-archive=")) return;
   tryAttach();
   watchForBoard();

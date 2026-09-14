@@ -29,20 +29,18 @@ function fixture(pathname, selectors = {}) {
   ] });
   const result = await chapters.scan('chapters');
   assert.equal(result.ok, true);
-  assert.deepEqual(Array.from(result.chapters, c => [c.id, c.title, c.order, c.hasVideo]), [
-    ['0', '1. Introduction', 1, true], ['10', '2. Skills to be Trained', 2, true],
+  assert.deepEqual(Array.from(result.chapters, c => [c.id, c.title, c.order]), [
+    ['0', '1. Introduction', 1], ['10', '2. Skills to be Trained', 2],
   ]);
-  const videos = fixture('/course/123333/0', { 'iframe[src]': [
-    { src: 'https://player.vimeo.com/video/1133911510?app_id=122963#t=7', title: 'New Introduction' },
-    { src: 'https://player.vimeo.com/video/1133911510?app_id=122963#t=8', title: 'Duplicate embed' },
-    { src: 'https://player.vimeo.com/video/42?h=secret', title: 'Second video' },
-    { src: 'https://justone.ai/embed/csd.html', title: 'Tracking' },
-    { src: 'https://player.vimeo.com.evil/video/1', title: 'Wrong host' },
-  ] });
-  const found = await videos.scan('videos');
-  assert.equal(found.videos.length, 2);
-  assert.equal(new URL(found.videos[0].url).hash, '');
-  assert.equal(found.videos[1].url, 'https://player.vimeo.com/video/42?h=secret');
+  const filter={checked:true,click(){this.checked=!this.checked;}};
+  const lessonPage=fixture('/course/123333/0',{
+    'label[title="Filter by video"] input':filter,
+    'a[href]':[anchor('/variation/42/','Introduction'),anchor('/variation/42/','Duplicate'),anchor('/variation/43/','Exercise')]
+  });
+  const found=await lessonPage.scan('lessons');
+  assert.equal(found.lessons.length,2);
+  assert.equal(found.lessons[0].id,'42');
+  assert.equal(filter.checked,true,'Restore the video filter');
   const trigger = { textContent: 'Active', click() {} };
   const option = label => ({ textContent: label, getClientRects: () => [{}], click: () => { trigger.textContent = label; } });
   const library = fixture('/', {
@@ -57,5 +55,5 @@ function fixture(pathname, selectors = {}) {
   assert.equal(library.handler({ type: 'ARCHIVE_SCAN', mode: 'library' }, {}, () => {}), false);
   const missing = await fixture('/course/123333').scan('chapters');
   assert.equal(missing.ok, false, 'Never report an empty/inaccessible course as scanned');
-  console.log('Scanner checks passed: library, chapter order, multiple players, deduplication, origin checks, scan isolation.');
+  console.log('Scanner checks passed: library, chapter/lesson order, filter restoration, deduplication, origin checks, scan isolation.');
 })();

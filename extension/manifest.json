@@ -1,28 +1,22 @@
 {
   "manifest_version": 3,
   "name": "Relay Rook (Chessable Sync)",
-  "version": "0.3.0",
-  "description": "Sync Chessable to a Chessnut board and archive your course videos for offline viewing.",
-  "permissions": ["storage", "webRequest"],
+  "version": "0.4.0",
+  "description": "Sync Chessable to a Chessnut board and archive course books as PGN and private Lichess studies.",
+  "permissions": ["storage", "scripting", "downloads"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*",
     "*://*.chess.localhost/*",
     "*://*.chessable.com/*",
-    "https://player.vimeo.com/*",
-    "https://*.vimeocdn.com/*"
+    "https://lichess.org/*"
   ],
   "background": { "service_worker": "src/background.js" },
   "content_scripts": [
     {
       "matches": ["*://*.chessable.com/*"],
-      "js": ["src/archive-scan.js", "src/boardParser.js", "src/content.js"],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": ["https://player.vimeo.com/video/*"],
-      "js": ["src/archive-player.js"],
-      "all_frames": true,
+      "js": ["archive/book.js", "src/archive-scan.js", "src/boardParser.js", "src/content.js"],
       "run_at": "document_idle"
     }
   ],
