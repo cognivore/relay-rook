@@ -3,6 +3,30 @@
 // Pure conversions shared by the scanner, downloaded books and tests.
 const Book = (() => {
   const text = value => String(value ?? '').replace(/\u00a0/g, ' ').trim();
+  const sanPattern = '(?:--|O-O(?:-O)?|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?)[+#]?';
+  // Canonical PGN NAGs for the glyphs rendered by Chessable's notation view.
+  const glyphs = {'!!':3,'??':4,'!?':5,'?!':6,'!':1,'?':2,'□':7,'=∞':44,'=':10,'∞':13,'⩲':14,'⩱':15,'±':16,'∓':17,'+-':18,'-+':19,'⨀':22,'⟳':32,'↑↑':32,'↑':36,'→':40,'⇆':132,'⊕':138,'∆':140,'N':146};
+  const glyphPattern = Object.keys(glyphs).sort((a,b)=>b.length-a.length).map(s=>s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|');
+  const notationPattern = new RegExp(`^(?:(\\d+\\.(?:\\.\\.)?)\\s*)?(${sanPattern})((?:(?:${glyphPattern})\\s*)*)$`);
+  function annotations(value) {
+    if (!new RegExp(`^(?:(?:${glyphPattern})\\s*)*$`).test(value)) throw Error(`Unsupported annotation: ${value}`);
+    if (/^[!?]{0,2}$/.test(value)) return value;
+    return [...value.matchAll(new RegExp(glyphPattern,'g'))].map(m=>' $'+glyphs[m[0]]).join('');
+  }
+  function move(displayed, data) {
+    const value = text(displayed), match = value.match(notationPattern);
+    if (!match || match[2].replace(/[+#]$/,'') !== data.san?.replace(/[+#]$/,'')) {
+      throw Error(`Displayed move ${JSON.stringify(value)} disagrees with data-san ${JSON.stringify(data.san)} at ${data.index || 'unknown index'}.`);
+    }
+    const position = fen(data.fen), fields = position.split(' '), black = fields[1] === 'w';
+    const fullmove = Number(fields[5]) - Number(black);
+    if (!Number.isSafeInteger(fullmove) || fullmove < 1) throw Error('Invalid move counter in the move FEN.');
+    const number = `${fullmove}${black?'...':'.'}`;
+    if ((match[1] && match[1] !== number) || (data.move && data.move !== number)) {
+      throw Error(`Move number disagrees with its FEN at ${data.index || 'unknown index'}: expected ${number}.`);
+    }
+    return {kind:'move',san:match[2],number,annotation:match[3].trim(),fen:position};
+  }
   function fen(value) {
     const parts = text(value).split(/\s+/);
     if (parts.length !== 6 || !/^[wb]$/.test(parts[1]) || !/^\d+$/.test(parts[5])) throw Error('Missing or invalid starting FEN.');
@@ -16,20 +40,31 @@ const Book = (() => {
   }
   function pgn(lesson) {
     let count = 0, depth = 0;
-    const combined=lesson.tokens.reduce((result,token)=>{
-      if(token.kind==='comment' && result.at(-1)?.kind==='comment')result.at(-1).text+='\n\n'+token.text;
-      else result.push({...token});
-      return result;
-    },[]);
+    // Lichess drops comments after a closing RAV. Gather each position's
+    // commentary before its side lines, without changing its text or owner.
+    const combined=[], parents=[];
+    let commentAt=0;
+    for (const token of lesson.tokens) {
+      if (token.kind==='comment') {
+        if (combined[commentAt-1]?.kind==='comment') combined[commentAt-1].text+='\n\n'+token.text;
+        else combined.splice(commentAt++,0,{...token});
+      } else {
+        combined.push(token);
+        if (token.kind==='open') { parents.push(commentAt); commentAt=combined.length; }
+        else if (token.kind==='close') {
+          if (!parents.length) throw Error('Unbalanced variation.');
+          commentAt=parents.pop();
+        } else commentAt=combined.length;
+      }
+    }
     const moves = combined.map(t => {
       if (t.kind === 'comment') return comment(t.text);
       if (t.kind === 'open') { depth++; return '('; }
       if (t.kind === 'close') { if (--depth < 0) throw Error('Unbalanced variation.'); return ')'; }
-      if (t.kind !== 'move' || !/^(?:--|O-O(?:-O)?[+#]?|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?)$/.test(t.san)) throw Error(`Unsupported move: ${t.san}`);
+      if (t.kind !== 'move' || !new RegExp(`^${sanPattern}$`).test(t.san)) throw Error(`Unsupported move: ${t.san}`);
       if (!/^\d+\.(?:\.\.)?$/.test(t.number)) throw Error('Move number missing.');
       fen(t.fen); count++;
-      if (!/^(?:[!?]{1,2})?$/.test(t.annotation)) throw Error(`Unsupported annotation: ${t.annotation}`);
-      return `${t.number} ${t.san}${t.annotation}`;
+      return `${t.number} ${t.san}${annotations(t.annotation)}`;
     });
     if (depth || (!count && !lesson.positionOnly)) throw Error('Incomplete move tree.');
     const name = `${lesson.chapterOrder}.${lesson.order} ${lesson.title}`;
@@ -110,6 +145,6 @@ const Book = (() => {
     });
   }
   const permission = value => { const url=new URL(instance(value)); return `${url.protocol}//${url.hostname}/*`; };
-  return {text, fen, pgn, instance, permission, safeName, html, signature, forLichess};
+  return {text, fen, move, pgn, instance, permission, safeName, html, signature, forLichess};
 })();
 if (typeof module !== 'undefined') module.exports = Book;

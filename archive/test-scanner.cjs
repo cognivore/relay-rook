@@ -47,7 +47,7 @@ function fixture(pathname, selectors = {}, hash = '#relay-rook-archive=test') {
 function lessonFixture(onRewind) {
   const initial='rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
   const after=initial.replace(' w ', ' b ');
-  const move={nodeType:1, dataset:{san:'--',move:'1.',fen:after},
+  const move={nodeType:1, childNodes:[{nodeType:3,textContent:'--'}], dataset:{san:'--',move:'1.',fen:after},
     matches:s=>s==='[data-san]',querySelector:()=>null};
   const comment={nodeType:1,tagName:'SPAN',innerHTML:'Exact introduction.',
     matches:s=>s==='.commentInVariation',childNodes:[{nodeType:3,textContent:'Exact introduction.'}]};
@@ -67,10 +67,10 @@ function lessonFixture(onRewind) {
     '.board-btns__btn .fa-chevron-left':()=>({closest:()=>state.previous}),
     '#inputFEN':state.input, '#theOpeningMoves':root,
     '#theOpeningMoves .textMoveHighlighted':()=>state.selected,
-    '#theOpeningMoves [data-san][data-move]':move,
+    '#theOpeningMoves [data-san][data-move]':()=>root.querySelectorAll()[0],
   });
   const meta={id:'42',courseId:'258968',course:'Preventing Blunders in Chess',chapterId:'1',chapter:'1. Introduction',chapterOrder:1,order:1,title:'Aim of the Course',url:origin+'/variation/42/'};
-  return {state,page,initial,move,scan:()=>page.scan('lesson',meta)};
+  return {state,page,initial,move,root,scan:()=>page.scan('lesson',meta)};
 }
 (async () => {
   const chapters = fixture('/course/123333', { 'a[href]': [
@@ -146,8 +146,39 @@ function lessonFixture(onRewind) {
   black.state.rewind.disabled=black.state.previous.disabled=true;black.state.selected=null;
   black.state.input.value='2r3k1/5bqp/8/7B/2r3PQ/5P2/6RK/6R1 b - - 0 1';
   Object.assign(black.move.dataset,{san:'Bxh5',move:'1...',fen:'2r3k1/6qp/8/7b/2r3PQ/5P2/6RK/6R1 w - - 0 2'});
+  black.move.childNodes[0].textContent='Bxh5';
   const blackResult=await black.scan();
   assert.equal(blackResult.ok,true,blackResult.error);
   assert.equal(blackResult.lesson.initialFen,black.state.input.value);
-  console.log('Scanner checks passed: enumeration, filters, order, scan isolation, replaced controls, delayed FEN, already at start, timeout and inconsistent board state.');
+  // Live Puzzle 58 has an unnumbered reply and an evaluation in a side line.
+  const puzzle=lessonFixture(()=>assert.fail('Puzzle is already at its starting position'));
+  puzzle.state.rewind.disabled=puzzle.state.previous.disabled=true;puzzle.state.selected=null;
+  puzzle.state.input.value='8/3k4/3b1n2/2p5/3n2pQ/8/5K2/3R4 b - - 0 1';
+  const domMove=(san,number,fen,piece,suffix,prefix='')=>({nodeType:1,
+    dataset:{san,move:number,fen},matches:s=>s==='[data-san]',childNodes:[
+      {nodeType:3,textContent:prefix},
+      {nodeType:1,dataset:{piece},matches:s=>s==='[role="img"][data-piece]'},
+      {nodeType:3,textContent:suffix}
+    ]});
+  const puzzleMoves=[
+    domMove('Bg3+','1...','8/3k4/5n2/2p5/3n2pQ/6b1/5K2/3R4 w - - 1 2','bishop','g3+'),
+    domMove('Kxg3','2.','8/3k4/5n2/2p5/3n2pQ/6K1/8/3R4 b - - 0 2','king','xg3!'),
+    domMove('Qxg3',null,'8/3k4/5n2/2p5/3n2p1/6Q1/5K2/3R4 b - - 0 2','queen','xg3??','2.'),
+    domMove('Ne4',null,'8/3k4/8/2p5/3nn1p1/6Q1/5K2/3R4 w - - 1 3','knight','e4+!','2...'),
+    domMove('Kg2',null,'8/3k4/8/2p5/3nn1p1/6Q1/6K1/3R4 b - - 2 3','king','g2','3.'),
+    domMove('Nxg3',null,'8/3k4/8/2p5/3n2p1/6n1/6K1/3R4 w - - 0 4','knight','xg3'),
+    domMove('Kxg3',null,'8/3k4/8/2p5/3n2p1/6K1/8/3R4 b - - 0 4','king','xg3=','4.'),
+  ];
+  puzzle.root.childNodes=[puzzle.root.childNodes[0],...puzzleMoves.slice(0,2),
+    {nodeType:1,matches:s=>s==='.commentSubvar',childNodes:puzzleMoves.slice(2)}];
+  puzzle.root.querySelectorAll=()=>puzzleMoves;
+  const puzzleResult=await puzzle.scan();
+  assert.equal(puzzleResult.ok,true,puzzleResult.error);
+  assert.match(puzzleResult.lesson.pgn,/1\.\.\. Bg3\+ 2\. Kxg3! \( 2\. Qxg3\?\? 2\.\.\. Ne4\+! 3\. Kg2 3\.\.\. Nxg3 4\. Kxg3 \$10 \)/);
+  assert.equal(puzzleResult.lesson.tokens.filter(t=>t.kind==='move').length,7);
+  puzzleMoves[5].dataset.san='Nxe3';
+  const disagreement=await puzzle.scan();
+  assert.equal(disagreement.ok,false,'A genuine notation/data disagreement still fails the entire lesson');
+  assert.match(disagreement.error,/Nxg3.*Nxe3/);
+  console.log('Scanner checks passed: enumeration, filters, order, scan isolation, rewind states, figurines, unnumbered side moves, evaluations and genuine data mismatches.');
 })();

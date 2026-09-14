@@ -179,14 +179,8 @@ const relayRookArchiveToken = location.hash.startsWith('#relay-rook-archive=') ?
         tokens.push({kind:'close'}); return;
       }
       if (node.matches('[data-san]')) {
-        let san=node.dataset.san, number=node.dataset.move, annotation=clean(node.querySelector('.annotation')?.textContent);
-        if (node.matches('.subvariation-context-menu__trigger')) {
-          const value=readable(node).replace(/[♔♕♖♗♘♙]/g,c=>({'♔':'K','♕':'Q','♖':'R','♗':'B','♘':'N','♙':''}[c])).trim();
-          const match=value.match(/^(\d+\.(?:\.\.)?)\s*(\S+?)([!?]{0,2})$/);
-          if(!match || match[2].replace(/[+#]$/,'')!==san.replace(/[+#]$/,'')) throw Error('The displayed subvariation disagrees with its move data.');
-          [,number,san,annotation]=match;
-        }
-        tokens.push({kind:'move',san,number,fen:node.dataset.fen,annotation});
+        const value=readable(node).replace(/[♔♕♖♗♘♙]/g,c=>({'♔':'K','♕':'Q','♖':'R','♗':'B','♘':'N','♙':''}[c]));
+        tokens.push(Book.move(value,node.dataset));
         moves++; return;
       }
       if (node.matches('.openingNum')) return;
