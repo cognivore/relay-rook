@@ -139,7 +139,8 @@ async function importBook(course) {
       await record(`course:${course.id}`,course);
     }
     if(!saved.configured){
-      await step('configure',{origin,name:`${course.title} · Book ${part}`.slice(0,100)});
+      const suffix=` · Book ${part}`;
+      await step('configure',{origin,name:course.title.slice(0,100-suffix.length)+suffix});
       saved.configured=true;await record(`course:${course.id}`,course);
     }
     await step('privacy',{origin});
@@ -158,6 +159,7 @@ async function importBook(course) {
 async function scan(all) {
   const priority=$('course').value.trim();
   if(!/^\d+$/.test(priority))throw Error('Enter a numeric priority course ID.');
+  report.issues=[];
   stage('Reading the Chessable library…');
   const library=await scanPage('https://www.chessable.com/','library');
   let courses=library.courses.sort((a,b)=>Number(b.id===priority)-Number(a.id===priority));
@@ -182,9 +184,10 @@ async function scan(all) {
                 stage(`Saving ${course.title} · ${chapter.title} · ${meta.title}`);
                 const result=await scanPage(meta.url,'lesson',{...meta,courseId:course.id,course:course.title,chapterId:chapter.id,chapter:chapter.title,chapterOrder:chapter.order});
                 await record(key,result.lesson);
+                log(`Saved ${course.title} · ${chapter.title} · ${meta.title} (${result.lesson.tokens.filter(t=>t.kind==='move').length} moves, ${result.lesson.commentHtml.length} commentary sections).`);
               }
               course.saved++;
-            }catch(error){failures++;issue(`${meta.title}: ${error.message}`);}
+            }catch(error){failures++;issue(`${meta.title}: ${error.message} Source: ${meta.url}`);}
             await record(`course:${course.id}`,course);await render();
           }
         }catch(error){failures++;issue(`${chapter.title}: ${error.message}`);}
@@ -223,5 +226,5 @@ window.addEventListener('beforeunload',event=>{if(running){event.preventDefault(
   $('instance').value=saved.bookInstance || 'https://lichess.org/';
   $('course').value=new URL(location.href).searchParams.get('course') || saved.bookPriority || '258968';
   if(saved.bookReport)report=saved.bookReport;
-  log('Book archive ready.');await render();
+  log(`Book archive ready · Relay Rook ${chrome.runtime.getManifest().version}.`);await render();
 })().catch(e=>{$('status').textContent=e.message;});

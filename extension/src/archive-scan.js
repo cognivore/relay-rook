@@ -112,18 +112,45 @@
     const body = [...node.childNodes].map(readable).join('');
     return /^(P|DIV|LI|UL|OL)$/.test(node.tagName) ? '\n' + body + '\n' : body;
   }
+  function startingFen() {
+    const control = icon => document.querySelector(`.board-btns__btn .${icon}`)?.closest('button');
+    const rewind = control('fa-fast-backward');
+    if (!rewind) throw Error('Cannot locate the starting-position control.');
+    return new Promise((resolve, reject) => {
+      const finish = (error, value) => {
+        observer.disconnect(); clearTimeout(timer);
+        if (error) reject(error); else resolve(value);
+      };
+      const check = () => {
+        // Chessable can replace controls while updating the board. Read the
+        // current DOM each time, including the FEN and selected-move state.
+        if (!control('fa-fast-backward')?.disabled || !control('fa-chevron-left')?.disabled
+          || document.querySelector('#theOpeningMoves .textMoveHighlighted')) return;
+        const value = document.querySelector('#inputFEN')?.value;
+        const first = document.querySelector('#theOpeningMoves [data-san][data-move]');
+        if (!value || !first) return;
+        try {
+          const initial = Book.fen(value), fields = initial.split(' ');
+          const number = first.dataset.move.match(/^(\d+)\.(\.\.)?$/);
+          if (!number) throw Error('The first move number is missing.');
+          if (fields[1] !== (number[2] ? 'b' : 'w') || Number(fields[5]) !== Number(number[1])) return;
+          finish(null, initial);
+        } catch (error) { finish(error); }
+      };
+      const observer = new MutationObserver(check);
+      const timer = setTimeout(() => finish(Error(
+        `Rewind did not settle within 8 seconds (rewind disabled: ${control('fa-fast-backward')?.disabled}, previous disabled: ${control('fa-chevron-left')?.disabled}, FEN: ${document.querySelector('#inputFEN')?.value || 'missing'}). The lesson was not saved.`
+      )), 8000);
+      observer.observe(document.body, {subtree:true, childList:true, attributes:true, attributeFilter:['disabled','value','class']});
+      if (!rewind.disabled) rewind.click();
+      check();
+    });
+  }
   async function lesson(meta) {
     if (!meta || location.pathname.replace(/\/$/,'') !== `/variation/${meta.id}`) throw Error('Lesson identity mismatch.');
     const breadcrumb = [...document.querySelectorAll('a[href]')].some(a => new URL(a.href).pathname.replace(/\/$/,'') === `/course/${meta.courseId}/${meta.chapterId}`);
     if (!breadcrumb) throw Error('The lesson does not belong to the expected course chapter.');
-    const rewind = document.querySelector('.board-btns__btn .fa-fast-backward')?.closest('button');
-    if (!rewind) throw Error('Cannot locate the starting-position control.');
-    if (!rewind.disabled) {
-      rewind.click();
-      for(let n=0;n<40 && !rewind.disabled;n++)await pause(50);
-      if(!rewind.disabled)throw Error('The board did not reach the starting position.');
-    }
-    const initialFen = Book.fen(document.querySelector('#inputFEN')?.value);
+    const initialFen = await startingFen();
     const root = document.querySelector('#theOpeningMoves');
     if (!root) throw Error('The lesson move tree is missing.');
     const tokens = [], comments = [];
