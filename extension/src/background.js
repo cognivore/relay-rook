@@ -103,8 +103,6 @@ async function pollPhysical() {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type?.startsWith("ARCHIVE_")) return false;
-  if (sender.tab?.url?.includes("#relay-rook-archive=")) return false;
   if (sender.tab) chessableTabId = sender.tab.id;
 
   if (!state.enabled && msg.type !== "GET_STATE" && msg.type !== "SET_CONFIG") {

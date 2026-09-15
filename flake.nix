@@ -18,7 +18,6 @@
           default        = self.packages.${system}.relay-rook;
         };
 
-        devShells.books = pkgs.mkShell { packages = [ pkgs.nodejs ]; };
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
             pkgs.haskell.compiler.ghc984Binary

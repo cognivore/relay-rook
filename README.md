@@ -1,7 +1,7 @@
 # relay-rook
 
 Bridge between **Chessable** (web) and a **Chessnut Move** robotic chess
-board. Two cooperating processes in this repo, one toolchain for each
+board. (Course archiving lives in its own repo, chessable-books.) Two cooperating processes in this repo, one toolchain for each
 job:
 
 ```
@@ -209,77 +209,3 @@ The pure/impure split inside the Haskell tree is the same as before:
 touch the OS. Tests in `test/RelayRook/ProgramSpec.hs` import no
 adapters and use mock instances of all three port classes — so the
 suite proves the architectural claim, not just the behaviour.
-
-## Course book archive
-
-Open Relay Rook → **Archive course books**. **Lichess instance** defaults to
-`https://lichess.org/`; enter the origin of your self-hosted Lichess to import there.
-Sign in to that instance first. No API token or separate download helper is needed.
-
-Use **Archive selected book** for the priority course, or **Archive all books**
-for your signed-in Chessable library. The scanner temporarily clears the video
-filter, visits each book lesson, rewinds to its starting position, and reads its
-rendered moves and commentary. It never starts MoveTrainer or moves the physical
-Chessnut board. Completed lessons persist in the extension's IndexedDB; starting
-again resumes them. Unexpected markup and incomplete chapters fail explicitly.
-
-Each completed course is saved in Chrome's download directory:
-
-```
-Relay Rook Books/Course title [course ID]/
-  Book 01.pgn
-  Book 02.pgn
-  Book.html
-  Source.json
-```
-
-Original PGN volumes hold at most 64 lessons. HTML is a standalone readable book; JSON
-retains the captured commentary HTML, FENs, move tokens and source metadata.
-PGN preserves commentary text and chess notation, not HTML typography. A book is
-not marked complete if any lesson failed. Check the activity log and scan report.
-
-Private Lichess studies use the chosen instance's existing browser login. The
-importer creates a blank study, sets **Invite only**, reopens the settings to
-verify privacy, then imports the PGN. It exports the resulting study and compares
-starting positions, move trees, annotations and comment text with the source.
-Whitespace and PGN annotation spelling are normalized for this comparison.
-Lichess rejects PGN null moves. For lessons where one side moves several times
-in a row, the importer explicitly starts a new chapter at each recorded post-null
-position. It preserves every real move and commentary; the local original PGN
-still contains the null moves. Informational lessons become position-only chapters.
-The 64-chapter volume limit is applied after this conversion. Artificial positions
-without both kings can be studied, but Lichess's engine cannot analyze them.
-Interrupted uploads are recorded before sending. Resuming first verifies what is
-already on the server and stops for inspection if it differs, rather than silently
-appending duplicate chapters. Verified volumes are not repeated.
-
-The extension requests access only to the instance you select. Extra hosts are
-optional permissions for self-hosted installations; changing the field does not
-transmit any course data. Remote instances require HTTPS, while local loopback
-instances can use HTTP. The default Lichess origin has a manifest permission.
-
-Reload the unpacked extension after updating. Version 0.4 replaces video capture
-permissions with scripting and downloads. Video experiments are preserved in
-commit `4d39fd9`; no video helper or CDM integration runs in the book workflow.
-The old ignored local helper configuration and any existing downloads are retained.
-
-A self-hosted Lichess installation has its own accounts and database. Saving a
-study on lichess.org does not synchronize that server to your laptop. Keep the
-local files and import the PGNs into your local instance before going offline.
-
-Checks (Nix supplies Node):
-
-```sh
-nix develop .#books -c node archive/test-book.cjs
-nix develop .#books -c node archive/test-scanner.cjs
-```
-
-Lichess's website forms and study import routes are used with its session login;
-upstream UI changes can require an adapter update. The field and endpoint checks
-fail explicitly instead of choosing another instance or authentication method.
-
-Live validation on lichess.org imported course 258968's introduction, an annotated
-lesson with a side variation, and a repeated-turn rook exercise split into two
-chapters. The exported annotated lesson retained all four commentary blocks;
-the split exercise retained its recorded FEN and final commentary. These checks
-cover the conversion/import format, not a completed full-library extension scan.
