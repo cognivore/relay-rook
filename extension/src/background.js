@@ -10,6 +10,12 @@ const BADGE_SYNCING = "#4CAF50";
 const BADGE_IDLE = "#9E9E9E";
 const BADGE_ERROR = "#F44336";
 
+// Everything the bridge is told is echoed here, so `read_console_messages`
+// (or the devtools console of the service worker) is a full record of what
+// this extension believed and sent. Orientation bugs are invisible without
+// it: the board silently does the wrong thing and nothing says why.
+const log = (...args) => console.log("[relay-rook]", ...args);
+
 const state = {
   enabled: true,
   apiUrl: DEFAULT_API_URL,
@@ -60,7 +66,9 @@ async function postFen(fen, force) {
     }
     state.lastSyncTime = Date.now();
     setBadge("ON", BADGE_SYNCING);
-    return await resp.json();
+    const result = await resp.json();
+    log("fen ->", fen, "force:", force, "rollback:", result.rollback);
+    return result;
   } catch (err) {
     console.warn("[relay-rook] post fen error:", err.message);
     setBadge("!", BADGE_ERROR);
@@ -70,12 +78,15 @@ async function postFen(fen, force) {
 
 async function postOrientation(orientation) {
   try {
-    await fetch(`${state.apiUrl}/api/board/orientation`, {
+    const resp = await fetch(`${state.apiUrl}/api/board/orientation`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ orientation }),
     });
-  } catch { /* best-effort */ }
+    log("orientation ->", orientation, resp.ok ? "accepted" : `rejected ${resp.status}`);
+  } catch (err) {
+    log("orientation ->", orientation, "failed:", err.message);
+  }
 }
 
 const startPoll = () => { stopPoll(); pollTimer = setInterval(pollPhysical, POLL_MS); };
@@ -98,6 +109,7 @@ async function pollPhysical() {
     if (placement === lastSentPlacement) return;
 
     lastSentPlacement = placement;
+    log("physical board moved:", placement);
     chrome.tabs.sendMessage(chessableTabId, { type: "PHYSICAL_FEN", placement }).catch(() => {});
   } catch { /* poll failure, ignore */ }
 }
@@ -129,6 +141,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (state.orientationMode === "auto"
           && msg.orientation
           && msg.orientation !== state.lastOrientation) {
+        log("chessable orientation changed:", state.lastOrientation, "->", msg.orientation);
         state.lastOrientation = msg.orientation;
         tasks.push(postOrientation(msg.orientation));
       }

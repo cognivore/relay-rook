@@ -4,6 +4,11 @@
 -- 'Orientation') before reaching pure code; programs run inside 'AppM'
 -- by way of 'liftIO . runAppM'. Scotty's 'ActionM' stays at the I/O
 -- boundary; programs never see it.
+--
+-- Every state-changing request is logged with what came in and what
+-- went out. The 2 Hz physical-board poll is deliberately not logged
+-- here; changes on that path are logged once, at decode time, in
+-- "RelayRook.Adapters".
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -14,11 +19,12 @@ module RelayRook.Server
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, (.=), (.:), (.:?))
 import Data.Aeson.Types (Parser, parseEither, withObject)
+import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
 import Network.HTTP.Types.Status (status400)
 import Web.Scotty (ScottyM, get, json, jsonData, post, status, text)
 
-import RelayRook.Adapters (AppM, Env, runAppM)
+import RelayRook.Adapters (AppM, Env, logLine, runAppM)
 import RelayRook.Core
   ( Fen
   , Orientation
@@ -54,9 +60,19 @@ server env = do
   post "/api/board/fen" $ do
     body :: Value <- jsonData
     case parseEither parseFenReq body of
-      Left err -> status status400 *> text (TL.pack err)
+      Left err -> do
+        logLine ("[http] POST /api/board/fen rejected: " <> err <> " body=" <> show body)
+        status status400 *> text (TL.pack err)
       Right (fen, force) -> do
+        logLine
+          ( "[http] POST /api/board/fen fen=" <> T.unpack (fenValue fen)
+              <> " force=" <> show force
+          )
         result <- liftIO $ runAppM env (syncBoardFen fen force)
+        logLine
+          ( "[http] POST /api/board/fen -> rollback=" <> show (syncRollback result)
+              <> " orientation=" <> T.unpack (orientationText (snapshotOrientation (syncSnapshot result)))
+          )
         json
           ( object
               [ "fen" .= fenValue (syncFen result)
@@ -71,9 +87,17 @@ server env = do
   post "/api/board/orientation" $ do
     body :: Value <- jsonData
     case parseEither parseOrientationReq body of
-      Left err -> status status400 *> text (TL.pack err)
+      Left err -> do
+        logLine ("[http] POST /api/board/orientation rejected: " <> err <> " body=" <> show body)
+        status status400 *> text (TL.pack err)
       Right o -> do
+        logLine ("[http] POST /api/board/orientation orientation=" <> T.unpack (orientationText o))
         snap <- liftIO $ runAppM env (syncBoardOrientation o)
+        logLine
+          ( "[http] POST /api/board/orientation -> orientation="
+              <> T.unpack (orientationText (snapshotOrientation snap))
+              <> " fen=" <> T.unpack (fenValue (snapshotFen snap))
+          )
         json (object ["orientation" .= orientationText (snapshotOrientation snap)])
 
 parseFenReq :: Value -> Parser (Fen, Bool)

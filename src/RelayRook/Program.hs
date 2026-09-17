@@ -70,14 +70,22 @@ syncBoardFen fen force = do
   pure SyncResult {syncFen = fen, syncRollback = rollback, syncSnapshot = snap}
 
 -- | Forward an orientation change to the board and record it.
+--
+-- The physical board has a fixed a1 corner, so a change of perspective
+-- means every piece has to move: after telling the board which way it
+-- is facing we re-push the current position so the device rearranges
+-- itself. Re-asserting an orientation that is already in force is a
+-- no-op on the board (no pointless 32-piece shuffle).
 syncBoardOrientation
   :: (MonadBoard m, MonadStore m, MonadClock m)
   => Orientation
   -> m Snapshot
 syncBoardOrientation orientation = do
   now <- getNow
-  setBoardOrientation orientation
   prev <- getSnapshot
+  let changed = orientation /= snapshotOrientation prev
+  setBoardOrientation orientation
+  when changed $ setBoardFen (snapshotFen prev) True
   let snap =
         Snapshot
           { snapshotFen = snapshotFen prev

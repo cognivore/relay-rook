@@ -9,6 +9,47 @@ const PIECE_TO_FEN = Object.freeze({
 const FILES = "abcdefgh";
 
 /**
+ * Which side of the board the viewer is sitting on.
+ *
+ * Geometry, not DOM order: Chessable positions squares absolutely and
+ * re-orders them freely, so "the first [data-square] in the document"
+ * says nothing reliable about perspective — that guess is what made a
+ * black-side lesson report "white". Compare where a1 and h8 actually
+ * render instead. a1 below-left of h8 means the white pieces are
+ * nearest the viewer.
+ *
+ * Falls back to the sign of the rank sequence in DOM order when the
+ * board has no layout yet (offscreen, display:none, a test harness),
+ * because getBoundingClientRect is all zeroes in that case.
+ *
+ * @param {Element} boardEl
+ * @param {NodeListOf<Element>} squareEls
+ * @returns {"white" | "black"}
+ */
+function detectOrientation(boardEl, squareEls) {
+  const a1 = boardEl.querySelector('[data-square="a1"]');
+  const h8 = boardEl.querySelector('[data-square="h8"]');
+  if (a1 && h8) {
+    const ra = a1.getBoundingClientRect();
+    const rh = h8.getBoundingClientRect();
+    const dy = ra.top - rh.top;
+    const dx = ra.left - rh.left;
+    // Either axis settles it; y is the one a flipped board always moves.
+    if (Math.abs(dy) > 1) return dy > 0 ? "white" : "black";
+    if (Math.abs(dx) > 1) return dx < 0 ? "white" : "black";
+  }
+
+  // No usable geometry: fall back to DOM order, reading the rank of the
+  // first and last squares rather than trusting a single one.
+  const first = squareEls[0].dataset.square;
+  const last = squareEls[squareEls.length - 1].dataset.square;
+  if (first && last && first[1] !== last[1]) {
+    return first[1] > last[1] ? "white" : "black";
+  }
+  return first && first[1] === "1" ? "black" : "white";
+}
+
+/**
  * Parse a chessable.com board DOM element into a FEN placement string
  * and detect the board orientation.
  *
@@ -28,10 +69,7 @@ function parseChessableBoard(boardEl) {
     }
   });
 
-  // First square in DOM order reveals perspective.
-  const firstSquare = squareEls[0].dataset.square;
-  const firstRank = firstSquare ? firstSquare[1] : "8";
-  const orientation = firstRank === "8" ? "white" : "black";
+  const orientation = detectOrientation(boardEl, squareEls);
 
   // Build FEN placement: rank 8 (top) down to rank 1 (bottom).
   const ranks = [];

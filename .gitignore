@@ -26,3 +26,6 @@ attic/**/__pycache__/
 archive/__pycache__/
 archive/.venv/
 extension/archive/local-config.json
+
+# macOS
+.DS_Store

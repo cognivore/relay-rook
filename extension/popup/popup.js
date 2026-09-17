@@ -24,7 +24,11 @@ function renderState(s) {
   orientBtns.forEach((btn) => btn.classList.toggle("active", btn.dataset.orient === mode));
 
   if (!s.enabled) { setStatus("gray", "Sync disabled"); fenDisplay.textContent = "--"; return; }
-  if (s.boardPresent && s.lastFen) { setStatus("green", "Syncing board"); fenDisplay.textContent = s.lastFen; }
+  if (s.boardPresent && s.lastFen) {
+    const facing = s.lastOrientation ? `, ${s.lastOrientation} facing you` : "";
+    setStatus("green", "Syncing board" + facing);
+    fenDisplay.textContent = s.lastFen;
+  }
   else if (s.boardPresent) { setStatus("green", "Board detected, waiting..."); fenDisplay.textContent = "--"; }
   else { setStatus("gray", "No board found — open a Chessable lesson"); fenDisplay.textContent = "--"; }
 }

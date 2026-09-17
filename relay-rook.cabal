@@ -76,13 +76,15 @@ test-suite relay-rook-test
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
     main-is:          Spec.hs
-    other-modules:    RelayRook.CoreSpec
+    other-modules:    RelayRook.CodecSpec
+                      RelayRook.CoreSpec
                       RelayRook.ProgramSpec
     build-tool-depends: hspec-discover:hspec-discover
     build-depends:    base
                     , relay-rook
                     , aeson
                     , hspec
+                    , bytestring
                     , mtl
                     , text
                     , time

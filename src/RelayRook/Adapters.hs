@@ -6,6 +6,13 @@
 --   of two.
 -- - 'SqliteStore': beam-sqlite + a few raw upserts.
 -- - 'SystemClock': wall-clock UTC.
+--
+-- Orientation is applied here, at the BLE boundary, and nowhere else:
+-- the rest of the system (HTTP, event log, snapshot, rollback
+-- detection) reasons in logical FENs exactly as Chessable shows them.
+-- When the player sits on the black side the position is rotated 180°
+-- on the way out and rotated back on the way in, so a physical board
+-- with a fixed a1 corner presents black at the near edge.
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -20,6 +27,7 @@ module RelayRook.Adapters
   , runAppM
   , mkEnv
   , spawnBleListener
+  , logLine
   ) where
 
 import Control.Concurrent (forkIO)
@@ -28,13 +36,16 @@ import Control.Exception (SomeException, try)
 import Control.Monad (void)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import System.Exit (ExitCode (ExitFailure))
+import System.IO (hFlush, stdout)
 import System.Posix.Process (exitImmediately)
 import Control.Monad.Reader (MonadReader, ReaderT, asks, runReaderT)
 import Data.Aeson (decodeStrict, encode)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as LBS
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, readIORef, writeIORef)
 import qualified Data.Text as T
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
@@ -64,7 +75,7 @@ import qualified Network.Socket.ByteString as SBS
 
 import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (parseEither, withObject, (.:))
-import RelayRook.Board.Codec (decodeBoardFen, encodeSync)
+import RelayRook.Board.Codec (decodeBoardFen, encodeSync, rotatePlacement)
 import qualified RelayRook.Board.Wire as Wire
 import RelayRook.Board.Wire (Op (..))
 import RelayRook.Core
@@ -88,6 +99,21 @@ import RelayRook.Schema
   )
 
 -- ---------------------------------------------------------------------
+-- Logging
+-- ---------------------------------------------------------------------
+
+-- | One timestamped line on stdout, flushed immediately. Under launchd
+-- stdout is a file, which GHC block-buffers by default — without the
+-- flush the log would only advance every few KiB (or at exit), which
+-- is exactly the "log stopped weeks ago while the service is running"
+-- symptom we had.
+logLine :: MonadIO m => String -> m ()
+logLine msg = liftIO $ do
+  now <- getCurrentTime
+  putStrLn (iso8601Show now <> " " <> msg)
+  hFlush stdout
+
+-- ---------------------------------------------------------------------
 -- Env / AppM
 -- ---------------------------------------------------------------------
 
@@ -96,6 +122,10 @@ data Env = Env
   , envBleSocket :: Socket
   , envBleWriteLock :: MVar ()
   , envLatestFen :: IORef (Maybe Fen)
+    -- ^ Logical FEN (already rotated back if the board faces black).
+  , envOrientation :: IORef Orientation
+    -- ^ Which side of the physical board the player sits on. Owned by
+    -- 'setBoardOrientation'; consulted by every encode and decode.
   }
 
 newtype AppM a = AppM {unAppM :: ReaderT Env IO a}
@@ -110,8 +140,19 @@ newtype AppM a = AppM {unAppM :: ReaderT Env IO a}
 runAppM :: Env -> AppM a -> IO a
 runAppM env (AppM m) = runReaderT m env
 
-mkEnv :: Connection -> Socket -> MVar () -> IORef (Maybe Fen) -> Env
+mkEnv :: Connection -> Socket -> MVar () -> IORef (Maybe Fen) -> IORef Orientation -> Env
 mkEnv = Env
+
+-- | Logical placement -> what the device must physically show.
+toPhysical :: Orientation -> Text -> Text
+toPhysical White = id
+toPhysical Black = rotatePlacement
+
+-- | What the device physically shows -> logical placement. Rotation is
+-- an involution, so this is the same function; named separately so
+-- call sites read correctly.
+toLogical :: Orientation -> Text -> Text
+toLogical = toPhysical
 
 -- ---------------------------------------------------------------------
 -- BLE setup helpers (called from Main, not from MonadBoard)
@@ -119,7 +160,7 @@ mkEnv = Env
 
 -- | Spawn the background reader: line-buffered JSON from the Rust
 -- daemon. FEN notifications populate 'envLatestFen'; everything else is
--- traced to stderr. The daemon runs its own auto-connect loop, so we
+-- traced to stdout. The daemon runs its own auto-connect loop, so we
 -- don't need to send 'OpConnect' from here.
 --
 -- If the daemon socket dies, we exit the whole process: the
@@ -137,29 +178,58 @@ spawnBleListener env = void . forkIO $ go
         Right (Just line) -> handleLine env line >> go
 
     die reason = do
-      putStrLn ("[ble] " <> reason <> "; exiting (launchd will restart)")
+      logLine ("[ble] " <> reason <> "; exiting (launchd will restart)")
       _ <- try @SomeException (close (envBleSocket env))
       exitImmediately (ExitFailure 1)
 
 handleLine :: Env -> BS.ByteString -> IO ()
 handleLine env line = case decodeStrict line :: Maybe Wire.Event of
-  Nothing -> putStrLn ("[ble] could not decode: " <> show line)
+  Nothing -> logLine ("[ble] could not decode: " <> show line)
   Just (Wire.EvNotification "fen" b64) ->
     case B64.decode (TE.encodeUtf8 b64) of
       Right bytes -> case decodeBoardFen bytes of
-        Just placement -> case parseFen placement of
-          Right fen -> writeIORef (envLatestFen env) (Just fen)
-          Left e -> putStrLn ("[ble] bad placement after decode: " <> e)
-        Nothing -> putStrLn "[ble] FEN notification did not decode"
-      Left e -> putStrLn ("[ble] bad base64 on FEN: " <> show e)
-  Just (Wire.EvNotification _ _) -> pure ()
+        Just physical -> do
+          orientation <- readIORef (envOrientation env)
+          let logical = toLogical orientation physical
+          case parseFen logical of
+            Right fen -> do
+              previous <- readIORef (envLatestFen env)
+              writeIORef (envLatestFen env) (Just fen)
+              -- The device streams its state twice a second; only a
+              -- change is worth a line.
+              if previous /= Just fen
+                then
+                  logLine
+                    ( "[board] physical position changed:"
+                        <> " orientation=" <> T.unpack (orientationText orientation)
+                        <> " device=" <> T.unpack physical
+                        <> " logical=" <> T.unpack logical
+                    )
+                else pure ()
+            Left e ->
+              logLine
+                ( "[ble] bad placement after decode: " <> e
+                    <> " (device=" <> T.unpack physical <> ")"
+                )
+        Nothing ->
+          logLine ("[ble] FEN notification did not decode: " <> hex bytes)
+      Left e -> logLine ("[ble] bad base64 on FEN: " <> show e)
+  Just (Wire.EvNotification other b64) ->
+    logLine ("[ble] notification " <> T.unpack other <> ": " <> hexB64 b64)
   Just (Wire.EvConnected addr name) ->
-    putStrLn ("[ble] connected: " <> T.unpack addr <> maybe "" ((" — " <>) . T.unpack) name)
+    logLine ("[ble] connected: " <> T.unpack addr <> maybe "" ((" — " <>) . T.unpack) name)
   Just Wire.EvDisconnected -> do
     writeIORef (envLatestFen env) Nothing
-    putStrLn "[ble] disconnected"
-  Just (Wire.EvError msg) -> putStrLn ("[ble] error: " <> T.unpack msg)
-  Just _ -> pure ()
+    logLine "[ble] disconnected"
+  Just (Wire.EvError msg) -> logLine ("[ble] error: " <> T.unpack msg)
+  Just Wire.EvAck -> pure ()
+  Just ev -> logLine ("[ble] event: " <> show ev)
+
+hex :: BS.ByteString -> String
+hex = BC.unpack . B16.encode
+
+hexB64 :: Text -> String
+hexB64 b64 = either (const ("<bad base64: " <> T.unpack b64 <> ">")) hex (B64.decode (TE.encodeUtf8 b64))
 
 sendOp :: Env -> Op -> IO ()
 sendOp env op = withMVar (envBleWriteLock env) $ \_ -> do
@@ -167,7 +237,7 @@ sendOp env op = withMVar (envBleWriteLock env) $ \_ -> do
   result <- try @SomeException (SBS.sendAll (envBleSocket env) (LBS.toStrict line))
   case result of
     Right () -> pure ()
-    Left e -> putStrLn ("[ble] send failed: " <> show e)
+    Left e -> logLine ("[ble] send failed: " <> show e)
 
 -- | Read one line (terminated by '\n') from the socket. Returns
 -- 'Nothing' on EOF.
@@ -315,9 +385,20 @@ parseUtc t = case iso8601ParseM (T.unpack t) of
 instance MonadBoard AppM where
   setBoardFen fen force = do
     env <- asks id
-    case encodeSync (fenPlacement fen) force of
-      Left err -> liftIO (putStrLn ("[ble] encodeSync: " <> err))
+    orientation <- liftIO (readIORef (envOrientation env))
+    let logical = fenPlacement fen
+        physical = toPhysical orientation logical
+    case encodeSync physical force of
+      Left err -> logLine ("[board] encodeSync failed: " <> err <> " (physical=" <> T.unpack physical <> ")")
       Right bytes -> do
+        logLine
+          ( "[board] sync:"
+              <> " orientation=" <> T.unpack (orientationText orientation)
+              <> " force=" <> show force
+              <> " logical=" <> T.unpack logical
+              <> " device=" <> T.unpack physical
+              <> " bytes=" <> hex bytes
+          )
         let b64 = TE.decodeUtf8 (B64.encode bytes)
         liftIO (sendOp env (OpWrite b64))
 
@@ -325,7 +406,18 @@ instance MonadBoard AppM where
     ref <- asks envLatestFen
     liftIO (readIORef ref)
 
-  -- Orientation has no physical analogue on the board; the snapshot
-  -- update in the program is the single source of truth.
-  setBoardOrientation _ = pure ()
-
+  -- The device has no notion of perspective; we remember which way
+  -- the player faces and rotate every position through that. The
+  -- program re-pushes the current FEN right after this, so the board
+  -- physically rearranges itself.
+  setBoardOrientation orientation = do
+    ref <- asks envOrientation
+    previous <- liftIO (readIORef ref)
+    liftIO (writeIORef ref orientation)
+    logLine
+      ( "[board] orientation "
+          <> T.unpack (orientationText previous)
+          <> " -> "
+          <> T.unpack (orientationText orientation)
+          <> (if previous == orientation then " (unchanged)" else " (board will be rearranged)")
+      )

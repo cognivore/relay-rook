@@ -166,6 +166,15 @@ spec = do
       snapshotOrientation (mockSnapshot s) `shouldBe` Black
       map eventKind (mockEvents s) `shouldBe` [OrientationSet]
 
+    it "re-pushes the current position when the orientation actually changes" $ do
+      let s = runMock (syncBoardOrientation Black >> pure ()) initialMock
+      mockSetFens s `shouldBe` [(start, True)]
+
+    it "does not re-push when the orientation is merely re-asserted" $ do
+      let s = runMock (syncBoardOrientation White >> pure ()) initialMock
+      mockSetOrientations s `shouldBe` [White]
+      mockSetFens s `shouldBe` []
+
   describe "observePhysicalBoard" $ do
     it "returns Nothing and emits no event when the board is silent" $ do
       let s = runMock (observePhysicalBoard >> pure ()) initialMock

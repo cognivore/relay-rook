@@ -19,6 +19,8 @@ module RelayRook.Board.Codec
   , encodeClearLeds
     -- * Decoders
   , decodeBoardFen
+    -- * Orientation
+  , rotatePlacement
     -- * Internals (exposed for tests)
   , fenPlacementToBoard
   ) where
@@ -76,6 +78,19 @@ fenPlacementToBoard placement =
               if length cs /= 8
                 then Left ("rank " <> T.unpack rank <> " does not sum to 8")
                 else Right cs
+
+-- ---------------------------------------------------------------------
+-- Orientation
+-- ---------------------------------------------------------------------
+
+-- | Rotate a FEN placement by 180°: rank 8 becomes the bottom row and
+-- the h-file becomes the leftmost column. The physical board has a
+-- fixed a1 corner, so when the player sits on the black side (the
+-- Chessable board is flipped) every position must be rotated before
+-- it is sent to the device, and rotated back when read from it.
+-- Involutive: @rotatePlacement . rotatePlacement = id@.
+rotatePlacement :: Text -> Text
+rotatePlacement = T.intercalate "/" . reverse . map T.reverse . T.splitOn "/"
 
 -- ---------------------------------------------------------------------
 -- Encoders
