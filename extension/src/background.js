@@ -20,7 +20,6 @@ const state = {
   enabled: true,
   apiUrl: DEFAULT_API_URL,
   orientationMode: "auto",
-  autoAdvance: true,
   lastFen: null,
   lastOrientation: null,
   lastSyncTime: null,
@@ -33,7 +32,6 @@ let pollTimer = null;
 // Lock state: when the server flags a rollback (or we push a new FEN),
 // don't echo the physical board back to chessable until it complies.
 let lockFen = null;
-let lockSince = 0;
 let lastSentPlacement = null;
 
 const setBadge = (text, color) => {
@@ -47,12 +45,10 @@ async function loadConfig() {
       apiUrl: DEFAULT_API_URL,
       enabled: true,
       orientationMode: "auto",
-      autoAdvance: true,
     });
     state.apiUrl = cfg.apiUrl;
     state.enabled = cfg.enabled;
     state.orientationMode = cfg.orientationMode;
-    state.autoAdvance = cfg.autoAdvance;
   } catch { /* keep defaults */ }
 }
 
@@ -106,7 +102,7 @@ async function pollPhysical() {
     if (!placement) return;
 
     if (lockFen !== null) {
-      if (placement === lockFen) { lockFen = null; lockSince = 0; } // physical complied
+      if (placement === lockFen) lockFen = null; // physical complied
       return;
     }
     if (placement === state.lastFen) { lastSentPlacement = null; return; }
@@ -134,7 +130,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const fromPhysical = msg.fen === lastSentPlacement;
         if (!fromPhysical) {
           lockFen = msg.fen;
-          lockSince = Date.now();
           tasks.push(postFen(msg.fen, true));
         }
       }
@@ -165,7 +160,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       state.boardPresent = false;
       state.lastFen = null;
       lockFen = null;
-      lockSince = 0;
       lastSentPlacement = null;
       stopPoll();
       setBadge("", BADGE_IDLE);
@@ -174,7 +168,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case "RECONNECT":
       lockFen = null;
-      lockSince = 0;
       lastSentPlacement = null;
       stopPoll();
       if (chessableTabId !== null) {
@@ -184,21 +177,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       sendResponse({ ok: false, reason: "no tab" });
       return false;
-
-    // The content script asks before it clicks Chessable's forward control.
-    // We hold it back while the robot is still rearranging itself: advancing
-    // then would score a variation the student never got to see on the board.
-    case "MAY_ADVANCE": {
-      if (!state.autoAdvance) {
-        sendResponse({ ok: false, reason: "auto-advance is switched off" });
-      } else if (lockFen !== null) {
-        const waiting = Math.round((Date.now() - lockSince) / 1000);
-        sendResponse({ ok: false, reason: `physical board has not reached the position yet (${waiting}s)` });
-      } else {
-        sendResponse({ ok: true });
-      }
-      return false;
-    }
 
     case "HEARTBEAT":
       if (state.boardPresent && !pollTimer) startPoll();
@@ -216,10 +194,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "SET_CONFIG":
       if (msg.apiUrl !== undefined) state.apiUrl = msg.apiUrl.replace(/\/+$/, "");
       if (msg.enabled !== undefined) state.enabled = msg.enabled;
-      if (msg.autoAdvance !== undefined) {
-        state.autoAdvance = msg.autoAdvance;
-        log("auto-advance", state.autoAdvance ? "on" : "off");
-      }
       if (msg.orientationMode !== undefined) {
         state.orientationMode = msg.orientationMode;
         const target = msg.orientationMode === "auto"
@@ -234,7 +208,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         apiUrl: state.apiUrl,
         enabled: state.enabled,
         orientationMode: state.orientationMode,
-        autoAdvance: state.autoAdvance,
       });
       setBadge(
         !state.enabled ? "OFF" : state.boardPresent ? "ON" : "",

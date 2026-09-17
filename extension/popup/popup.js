@@ -9,8 +9,7 @@ const statusText = $("status-text");
 const fenDisplay = $("fen-display");
 const apiUrlInput = $("api-url");
 const reconnectBtn = $("reconnect-btn");
-const orientBtns = document.querySelectorAll("[data-orient]");
-const advanceBtns = document.querySelectorAll("[data-advance]");
+const orientBtns = document.querySelectorAll(".orient-btn");
 
 const setStatus = (cls, text) => {
   statusDot.className = "dot " + cls;
@@ -23,8 +22,6 @@ function renderState(s) {
   apiUrlInput.value = s.apiUrl || "http://127.0.0.1:8674";
   const mode = s.orientationMode || "auto";
   orientBtns.forEach((btn) => btn.classList.toggle("active", btn.dataset.orient === mode));
-  const advance = s.autoAdvance ? "on" : "off";
-  advanceBtns.forEach((btn) => btn.classList.toggle("active", btn.dataset.advance === advance));
 
   if (!s.enabled) { setStatus("gray", "Sync disabled"); fenDisplay.textContent = "--"; return; }
   if (s.boardPresent && s.lastFen) {
@@ -54,11 +51,6 @@ apiUrlInput.addEventListener("input", () => {
 orientBtns.forEach((btn) =>
   btn.addEventListener("click", () =>
     chrome.runtime.sendMessage({ type: "SET_CONFIG", orientationMode: btn.dataset.orient }, fetchState)));
-
-advanceBtns.forEach((btn) =>
-  btn.addEventListener("click", () =>
-    chrome.runtime.sendMessage(
-      { type: "SET_CONFIG", autoAdvance: btn.dataset.advance === "on" }, fetchState)));
 
 reconnectBtn.addEventListener("click", () => {
   reconnectBtn.textContent = "Reconnecting...";

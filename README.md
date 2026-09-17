@@ -184,17 +184,6 @@ as an unpacked extension in Chrome (`chrome://extensions` → Developer
 mode → Load unpacked → `extension/`). Default API URL `http://127.0.0.1:8674`
 matches the bridge default.
 
-The popup carries three controls: sync on/off, board orientation
-(auto/white/black) and **Auto-next**. Auto-next lets a MoveTrainer
-session move to the next variation on its own, for practising on the
-physical board with the screen out of reach. It turns on Chessable's own
-Auto-next toggle where it finds it, and otherwise clicks the forward
-control itself, but only that one: "Skip", "Give up", "Exit", "Next
-chapter" and "Next course" are all refused, so an unattended session
-stays inside the material being trained and never abandons a puzzle. It
-also waits while the robot is still rearranging itself, because
-advancing then would score a variation that never reached the board.
-
 ## Why this shape
 
 A pure-Haskell BLE driver does not exist on macOS — `bleak` works in
