@@ -20,10 +20,26 @@ use uuid::Uuid;
 
 use crate::chessnut;
 
+/// How long the board may say nothing before we treat the link as dead. It
+/// streams its state about twice a second, so this is a very long silence.
+const SILENCE_LIMIT: Duration = Duration::from_secs(15);
+/// Upper bound on one connect attempt, scan included.
+const CONNECT_LIMIT: Duration = Duration::from_secs(45);
+/// How long the Bluetooth stack may stay unusable before we give up on this
+/// process and let the service manager restart us.
+const STACK_GIVE_UP: Duration = Duration::from_secs(180);
+/// The one connect failure that means "nothing wrong, just no board here".
+const NO_BOARD: &str = "no Chessnut Move board found";
+
+/// Anything the board does that a socket client needs to hear about. This
+/// carries the loss of the link as well as its traffic: a client that is only
+/// told about notifications has no way to distinguish a quiet board from one
+/// that is gone, and will happily keep serving the last position it saw.
 #[derive(Clone)]
-pub enum Notification {
+pub enum BoardEvent {
     Fen(Vec<u8>),
     Cmd(Vec<u8>),
+    Disconnected,
 }
 
 /// A discovered Chessnut board. We keep the live `peripheral` handle so
@@ -43,12 +59,17 @@ pub struct State {
     pub name: Option<String>,
     pub command_write: Option<Characteristic>,
     pub last_fen_notification: Option<Vec<u8>>,
+    /// When the board last said anything. The Chessnut streams its state
+    /// continuously, so silence is the most reliable evidence that the link
+    /// has died — more reliable than asking btleplug, which on macOS can keep
+    /// reporting a peripheral as connected after its event loop has gone.
+    pub last_heard: Option<Instant>,
 }
 
 pub struct Ble {
     pub adapter: Adapter,
     pub state: Arc<Mutex<State>>,
-    pub notifications: broadcast::Sender<Notification>,
+    pub notifications: broadcast::Sender<BoardEvent>,
     /// Serializes BLE scans. Concurrent `start_scan`/`stop_scan` calls
     /// (e.g. the auto-connect loop racing a client `Op::Scan`) corrupt
     /// btleplug's CoreBluetooth backend — it logs "Event receiver died"
@@ -206,9 +227,12 @@ impl Ble {
                 let kind = if n.uuid == chessnut::FEN_NOTIFY_UUID {
                     let mut st = state_arc.lock().await;
                     st.last_fen_notification = Some(n.value.clone());
-                    Notification::Fen(n.value)
+                    st.last_heard = Some(Instant::now());
+                    BoardEvent::Fen(n.value)
                 } else if n.uuid == chessnut::COMMAND_NOTIFY_UUID {
-                    Notification::Cmd(n.value)
+                    let mut st = state_arc.lock().await;
+                    st.last_heard = Some(Instant::now());
+                    BoardEvent::Cmd(n.value)
                 } else {
                     tracing::debug!(uuid=%n.uuid, "notification on unknown characteristic, dropping");
                     continue;
@@ -216,7 +240,21 @@ impl Ble {
                 // Receivers may all have disconnected; that's fine.
                 let _ = notif_tx.send(kind);
             }
-            tracing::warn!("BLE notification stream ended");
+            // The stream ending is the earliest notice we get that the board
+            // is gone. Tear the connection down here rather than waiting for
+            // the health check, and tell the clients so they stop trusting the
+            // position they are holding.
+            tracing::warn!("BLE notification stream ended; dropping the connection");
+            {
+                let mut st = state_arc.lock().await;
+                st.peripheral = None;
+                st.address = None;
+                st.name = None;
+                st.command_write = None;
+                st.last_fen_notification = None;
+                st.last_heard = None;
+            }
+            let _ = notif_tx.send(BoardEvent::Disconnected);
         });
 
         // Send INIT and CONFIG so the board starts streaming.
@@ -234,19 +272,28 @@ impl Ble {
         st.address = Some(addr.to_string());
         st.name = name.clone();
         st.command_write = Some(cmd_write);
+        st.last_heard = Some(Instant::now());
 
         Ok((addr.to_string(), name))
     }
 
     pub async fn disconnect(&self) -> Result<()> {
         let mut st = self.state.lock().await;
+        let had_peripheral = st.peripheral.is_some();
         if let Some(p) = st.peripheral.take() {
-            let _ = p.disconnect().await;
+            // The peripheral may be wedged; do not let its teardown hang the
+            // caller, which on the auto-connect path is the recovery loop.
+            let _ = tokio::time::timeout(Duration::from_secs(5), p.disconnect()).await;
         }
         st.address = None;
         st.name = None;
         st.command_write = None;
         st.last_fen_notification = None;
+        st.last_heard = None;
+        drop(st);
+        if had_peripheral {
+            let _ = self.notifications.send(BoardEvent::Disconnected);
+        }
         Ok(())
     }
 
@@ -265,7 +312,11 @@ impl Ble {
         } else {
             WriteType::WithoutResponse
         };
-        peripheral.write(cwrite, data, wtype).await?;
+        // A wedged CoreBluetooth can leave this pending forever, and the
+        // bridge is waiting on the other end of the socket.
+        tokio::time::timeout(Duration::from_secs(10), peripheral.write(cwrite, data, wtype))
+            .await
+            .map_err(|_| anyhow!("timed out writing to the board"))??;
         Ok(())
     }
 
@@ -279,40 +330,121 @@ impl Ble {
         st.last_fen_notification.clone()
     }
 
-    /// Spawn the auto-connect / auto-reconnect loop. Replaces the
-    /// "client must explicitly send Op::Connect" model — the daemon
-    /// now scans on its own forever, and recovers transparently when
-    /// the board powers off, sleeps, or moves out of range.
+    /// Spawn the auto-connect / auto-reconnect loop. The daemon scans on its
+    /// own forever and recovers when the board powers off, sleeps, or moves out
+    /// of range.
     ///
-    /// Mirrors openchessnutmove's `DriverManager._auto_connect_loop`.
+    /// Every await in here is bounded. btleplug's CoreBluetooth backend can
+    /// drop its event loop ("Event receiver died") and leave a peripheral that
+    /// answers nothing and never errors, so an unbounded `is_connected` or
+    /// `connect` parks this task forever and the daemon goes quiet while
+    /// looking perfectly healthy to launchd. That is exactly the failure this
+    /// loop exists to recover from, so it must not be able to suffer it.
     pub fn start_autoconnect(self: &Arc<Self>) {
         let me = self.clone();
         tokio::spawn(async move {
+            // When the stack (not merely the board) has been unwell since.
+            let mut unwell_since: Option<Instant> = None;
+            let mut note = |unwell: &mut Option<Instant>, bad: bool| {
+                if bad {
+                    unwell.get_or_insert_with(Instant::now);
+                } else {
+                    *unwell = None;
+                }
+            };
+
             loop {
-                let (connected, peripheral) = {
+                let (peripheral, last_heard) = {
                     let st = me.state.lock().await;
-                    (st.peripheral.is_some(), st.peripheral.clone())
+                    (st.peripheral.clone(), st.last_heard)
                 };
-                if connected {
-                    // Confirm the peripheral is still alive; clear and
-                    // rescan if it died.
-                    if let Some(p) = peripheral {
-                        let alive = p.is_connected().await.unwrap_or(false);
-                        if !alive {
-                            tracing::warn!("auto-connect: peripheral disconnected; will rescan");
+
+                match peripheral {
+                    Some(p) => {
+                        // The board streams its state continuously, so silence
+                        // is the most trustworthy evidence the link is gone.
+                        // btleplug is asked too, but it is not believed on its
+                        // own and it is not allowed to take its time.
+                        let silent_for = last_heard.map(|t| t.elapsed());
+                        let silent = silent_for.map(|d| d > SILENCE_LIMIT).unwrap_or(true);
+
+                        let alive = match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            p.is_connected(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(v)) => v,
+                            Ok(Err(e)) => {
+                                tracing::warn!(error=?e, "auto-connect: is_connected failed");
+                                false
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "auto-connect: is_connected did not answer within 5s; \
+                                     treating the link as dead"
+                                );
+                                note(&mut unwell_since, true);
+                                false
+                            }
+                        };
+
+                        if silent || !alive {
+                            tracing::warn!(
+                                silent_for = ?silent_for,
+                                alive,
+                                "auto-connect: board is gone; dropping the connection and rescanning"
+                            );
                             let _ = me.disconnect().await;
+                        } else {
+                            note(&mut unwell_since, false);
                         }
                     }
-                } else {
-                    match me.connect(None).await {
-                        Ok((addr, name)) => {
-                            tracing::info!(addr=%addr, name=?name, "auto-connect: connected");
-                        }
-                        Err(e) => {
-                            tracing::debug!(error=?e, "auto-connect: not yet, retrying in 3s");
+                    None => {
+                        match tokio::time::timeout(CONNECT_LIMIT, me.connect(None)).await {
+                            Ok(Ok((addr, name))) => {
+                                tracing::info!(addr=%addr, name=?name, "auto-connect: connected");
+                                note(&mut unwell_since, false);
+                            }
+                            Ok(Err(e)) => {
+                                // No board in range is the normal state of an
+                                // idle desk, not a sick Bluetooth stack.
+                                let benign = e.to_string().contains(NO_BOARD);
+                                if benign {
+                                    tracing::debug!("auto-connect: no board in range, retrying");
+                                } else {
+                                    tracing::warn!(error=?e, "auto-connect: connect failed");
+                                }
+                                note(&mut unwell_since, !benign);
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "auto-connect: connect did not finish within {:?}",
+                                    CONNECT_LIMIT
+                                );
+                                note(&mut unwell_since, true);
+                            }
                         }
                     }
                 }
+
+                // Last resort. If the Bluetooth stack has been unusable for
+                // this long, no amount of rescanning inside this process will
+                // fix it — the adapter handle itself is spoiled. Exit and let
+                // launchd (KeepAlive = true) hand us a fresh one. Staying up
+                // and quiet is the worst option, because nothing upstream can
+                // tell that apart from a working daemon with an idle board.
+                if let Some(since) = unwell_since {
+                    if since.elapsed() > STACK_GIVE_UP {
+                        tracing::error!(
+                            "Bluetooth stack has been unusable for {:?}; exiting so the \
+                             service manager can restart us with a clean adapter",
+                            since.elapsed()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });

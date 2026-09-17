@@ -49,7 +49,7 @@ import Data.IORef (IORef, readIORef, writeIORef)
 import qualified Data.Text as T
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
-import Data.Time (UTCTime, getCurrentTime)
+import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Database.Beam
   ( Identity
@@ -121,8 +121,10 @@ data Env = Env
   { envDbConn :: Connection
   , envBleSocket :: Socket
   , envBleWriteLock :: MVar ()
-  , envLatestFen :: IORef (Maybe Fen)
-    -- ^ Logical FEN (already rotated back if the board faces black).
+  , envLatestFen :: IORef (Maybe (Fen, UTCTime))
+    -- ^ Logical FEN (already rotated back if the board faces black), with
+    -- the moment it arrived. The timestamp is what stops us handing out a
+    -- position from a board that is no longer there.
   , envOrientation :: IORef Orientation
     -- ^ Which side of the physical board the player sits on. Owned by
     -- 'setBoardOrientation'; consulted by every encode and decode.
@@ -140,8 +142,18 @@ newtype AppM a = AppM {unAppM :: ReaderT Env IO a}
 runAppM :: Env -> AppM a -> IO a
 runAppM env (AppM m) = runReaderT m env
 
-mkEnv :: Connection -> Socket -> MVar () -> IORef (Maybe Fen) -> IORef Orientation -> Env
+mkEnv :: Connection -> Socket -> MVar () -> IORef (Maybe (Fen, UTCTime)) -> IORef Orientation -> Env
 mkEnv = Env
+
+-- | How long the board may say nothing before we stop believing the last
+-- position it gave us. It streams its state about twice a second, so this is
+-- a very long silence. Going quiet is not hypothetical: btleplug can lose its
+-- CoreBluetooth event loop and leave the daemon holding a peripheral that
+-- answers nothing, and without this the bridge serves that stale position to
+-- the extension forever, which then plays moves against a board that is not
+-- in front of anyone.
+boardSilenceLimit :: NominalDiffTime
+boardSilenceLimit = 15
 
 -- | Logical placement -> what the device must physically show.
 toPhysical :: Orientation -> Text -> Text
@@ -194,10 +206,11 @@ handleLine env line = case decodeStrict line :: Maybe Wire.Event of
           case parseFen logical of
             Right fen -> do
               previous <- readIORef (envLatestFen env)
-              writeIORef (envLatestFen env) (Just fen)
+              now <- getCurrentTime
+              writeIORef (envLatestFen env) (Just (fen, now))
               -- The device streams its state twice a second; only a
               -- change is worth a line.
-              if previous /= Just fen
+              if fmap fst previous /= Just fen
                 then
                   logLine
                     ( "[board] physical position changed:"
@@ -404,7 +417,23 @@ instance MonadBoard AppM where
 
   getBoardFen = do
     ref <- asks envLatestFen
-    liftIO (readIORef ref)
+    current <- liftIO (readIORef ref)
+    case current of
+      Nothing -> pure Nothing
+      Just (fen, seenAt) -> do
+        now <- liftIO getCurrentTime
+        if diffUTCTime now seenAt > boardSilenceLimit
+          then do
+            -- Clearing the ref also makes this log line fire once rather
+            -- than on every poll.
+            liftIO (writeIORef ref Nothing)
+            logLine
+              ( "[board] silent for over "
+                  <> show boardSilenceLimit
+                  <> "; the position is no longer trustworthy and will be reported as unknown"
+              )
+            pure Nothing
+          else pure (Just fen)
 
   -- The device has no notion of perspective; we remember which way
   -- the player faces and rotate every position through that. The

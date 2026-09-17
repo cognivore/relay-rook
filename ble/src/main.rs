@@ -27,7 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex};
 
-use crate::ble::{Ble, Notification};
+use crate::ble::{Ble, BoardEvent};
 use crate::wire::{DeviceInfo, Event, Op};
 
 #[derive(Parser, Debug)]
@@ -307,21 +307,24 @@ async fn dispatch(op: Op, slot: &BleSlot) -> Event {
 }
 
 async fn forward_notifications(
-    mut rx: broadcast::Receiver<Notification>,
+    mut rx: broadcast::Receiver<BoardEvent>,
     writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
 ) {
     loop {
         match rx.recv().await {
             Ok(n) => {
                 let event = match n {
-                    Notification::Fen(b) => Event::Notification {
+                    BoardEvent::Fen(b) => Event::Notification {
                         characteristic: "fen",
                         data: B64.encode(b),
                     },
-                    Notification::Cmd(b) => Event::Notification {
+                    BoardEvent::Cmd(b) => Event::Notification {
                         characteristic: "cmd",
                         data: B64.encode(b),
                     },
+                    // Pushed, not asked for: the client has to learn that the
+                    // position it is holding is no longer real.
+                    BoardEvent::Disconnected => Event::Disconnected,
                 };
                 if send(&writer, event).await.is_err() {
                     break;
