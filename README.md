@@ -164,6 +164,11 @@ This generates **two coordinated services**:
 - `relay-rook`      (launchd agent / systemd user unit) — bridge,
   ordered after the BLE daemon; retries the socket on boot
 
+On macOS with `systeml.enable = true`, SystemL owns both services and the
+standalone launchd agents are disabled. This keeps Bluetooth requests under
+SystemL's existing permission identity and prevents two supervisors from
+competing for the same socket and board. Macs without SystemL use launchd.
+
 The state directory (`~/.local/state/relay-rook/`) is created by
 home-manager activation.
 

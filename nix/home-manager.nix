@@ -5,6 +5,11 @@ let
   bridgePkg = flake.packages.${pkgs.stdenv.hostPlatform.system}.relay-rook;
   blePkg    = flake.packages.${pkgs.stdenv.hostPlatform.system}.relay-rook-ble;
   homeDir   = config.home.homeDirectory;
+  # SystemL already supervises systemd.user units on Darwin. Running the
+  # launchd copies as well races two BLE owners and bypasses SystemL's TCC
+  # identity, producing another Bluetooth permission entry on every build.
+  useSysteml = pkgs.stdenv.hostPlatform.isDarwin && (config.systeml.enable or false);
+  useLaunchd = pkgs.stdenv.hostPlatform.isDarwin && !useSysteml;
 
   defaultSocket = "${homeDir}/.local/state/relay-rook/ble.sock";
 
@@ -82,7 +87,7 @@ in
   config = lib.mkIf cfg.enable {
     # ---------- macOS launchd ----------
     launchd.agents.relay-rook-ble = {
-      enable = true;
+      enable = useLaunchd;
       config = {
         ProgramArguments = [ "${cfg.blePackage}/bin/relay-rook-ble" ];
         EnvironmentVariables = bleEnv // { HOME = homeDir; };
@@ -94,7 +99,7 @@ in
     };
 
     launchd.agents.relay-rook = {
-      enable = true;
+      enable = useLaunchd;
       config = {
         ProgramArguments = [ "${cfg.bridgePackage}/bin/relay-rook" ];
         EnvironmentVariables = bridgeEnv // cfg.extraEnvironment // { HOME = homeDir; };
