@@ -10,7 +10,7 @@ unsafe_code = "forbid"
 [dependencies]
 anyhow      = "1"
 base64      = "0.22"
-btleplug    = "0.11"
+btleplug    = { version = "0.11.8", path = "vendor/btleplug" }
 clap        = { version = "4", features = ["derive", "env"] }
 futures     = "0.3"
 serde       = { version = "1", features = ["derive"] }
@@ -23,3 +23,7 @@ uuid        = "1"
 [[bin]]
 name = "relay-rook-ble"
 path = "src/main.rs"
+
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", default-features = false, features = ["std", "NSObject"] }

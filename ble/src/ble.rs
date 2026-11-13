@@ -8,17 +8,18 @@
 
 use anyhow::{anyhow, Context, Result};
 use btleplug::api::{
-    Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
-    ScanFilter, WriteType,
+    Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
+    ScanFilter, ValueNotification, WriteType,
 };
-use btleplug::platform::{Adapter, Manager, Peripheral};
-use futures::stream::StreamExt;
+use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
+use futures::stream::{Stream, StreamExt};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
-use crate::chessnut;
+use crate::{chessnut, scan};
 
 /// How long the board may say nothing before we treat the link as dead. It
 /// streams its state about twice a second, so this is a very long silence.
@@ -64,6 +65,16 @@ pub struct State {
     /// has died — more reliable than asking btleplug, which on macOS can keep
     /// reporting a peripheral as connected after its event loop has gone.
     pub last_heard: Option<Instant>,
+    session: Arc<()>,
+    notification_tasks: tokio::task::JoinSet<()>,
+}
+
+impl State {
+    fn clear(&mut self) {
+        // Replacing the JoinSet aborts the old listener, including listeners
+        // waiting on a notification stream that never closes by itself.
+        *self = Self::default();
+    }
 }
 
 pub struct Ble {
@@ -74,7 +85,8 @@ pub struct Ble {
     /// (e.g. the auto-connect loop racing a client `Op::Scan`) corrupt
     /// btleplug's CoreBluetooth backend — it logs "Event receiver died"
     /// and the adapter goes dead until the process restarts.
-    scan_lock: Mutex<()>,
+    scan_lock: Arc<Mutex<()>>,
+    connection_lock: Mutex<()>,
 }
 
 impl Ble {
@@ -103,62 +115,37 @@ impl Ble {
             adapter,
             state: Arc::new(Mutex::new(State::default())),
             notifications: tx,
-            scan_lock: Mutex::new(()),
+            scan_lock: Arc::new(Mutex::new(())),
+            connection_lock: Mutex::new(()),
         })
     }
 
     /// Scan for Chessnut Move boards, returning live peripheral handles.
     ///
-    /// We poll `peripherals()` repeatedly during the window and return as
-    /// soon as a board appears, rather than sleeping the whole `timeout`
-    /// and reading once: on a cold adapter the device is frequently not
-    /// in the list until several advertising intervals in, which made the
-    /// old fixed-5s single read miss boards that were plainly present.
-    /// If nothing shows up we keep looking until `timeout` elapses.
+    /// Subscribe before starting the scan so the first advertisement cannot
+    /// race the listener. Inspect only newly discovered/updated devices.
     pub async fn scan(&self, timeout: Duration) -> Result<Vec<ScanMatch>> {
-        let _scan_guard = self.scan_lock.lock().await;
-        self.adapter.start_scan(ScanFilter::default()).await?;
-        let deadline = Instant::now() + timeout;
-        let matches = loop {
-            let found = self.matching_peripherals().await?;
-            if !found.is_empty() || Instant::now() >= deadline {
-                break found;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
-        let _ = self.adapter.stop_scan().await;
-        Ok(matches)
-    }
-
-    /// One pass over the adapter's currently-known peripherals, keeping
-    /// those whose advertised name marks them as a Chessnut board.
-    async fn matching_peripherals(&self) -> Result<Vec<ScanMatch>> {
-        let peripherals = self.adapter.peripherals().await?;
-        let mut out = Vec::new();
-        for p in peripherals {
-            let props = match p.properties().await? {
-                Some(props) => props,
-                None => continue,
-            };
-            let is_chessnut = props
-                .local_name
-                .as_deref()
-                .map(|n| n.contains(chessnut::NAME_PREFIX))
-                .unwrap_or(false);
-            if is_chessnut {
-                out.push(ScanMatch {
-                    address: p.address().to_string(),
-                    name: props.local_name,
-                    peripheral: p,
-                });
-            }
-        }
-        Ok(out)
+        scan::scan(
+            BoardDiscovery {
+                adapter: self.adapter.clone(),
+                address: None,
+            },
+            self.scan_lock.clone(),
+            timeout,
+        )
+        .await
     }
 
     /// Connect to the first matching Chessnut, or to a specific address
     /// if `address_filter` is set.
-    pub async fn connect(&self, address_filter: Option<String>) -> Result<(String, Option<String>)> {
+    pub async fn connect(
+        &self,
+        address_filter: Option<String>,
+    ) -> Result<(String, Option<String>)> {
+        let deadline = tokio::time::Instant::now() + CONNECT_LIMIT;
+        let _connection = tokio::time::timeout_at(deadline, self.connection_lock.lock())
+            .await
+            .context("timed out waiting for another board connection operation")?;
         // If already connected, return current state.
         {
             let st = self.state.lock().await;
@@ -167,14 +154,23 @@ impl Ble {
             }
         }
 
-        let candidates = self.scan(Duration::from_secs(10)).await?;
-        let chosen = match address_filter {
-            Some(filter) => candidates
-                .into_iter()
-                .find(|m| m.address.eq_ignore_ascii_case(&filter)),
-            None => candidates.into_iter().next(),
-        }
-        .ok_or_else(|| anyhow!("no Chessnut Move board found"))?;
+        let candidates = tokio::time::timeout_at(
+            deadline,
+            scan::scan(
+                BoardDiscovery {
+                    adapter: self.adapter.clone(),
+                    address: address_filter,
+                },
+                self.scan_lock.clone(),
+                Duration::from_secs(10),
+            ),
+        )
+        .await
+        .context("timed out scanning for the board")??;
+        let chosen = candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no Chessnut Move board found"))?;
 
         // Connect to the scanned handle directly — do NOT re-fetch and
         // match by address. On macOS every peripheral's address is
@@ -187,97 +183,90 @@ impl Ble {
             name,
         } = chosen;
 
-        peripheral.connect().await.context("BLE connect")?;
-        peripheral
-            .discover_services()
-            .await
-            .context("discover_services")?;
+        let setup = tokio::time::timeout_at(deadline, async {
+            peripheral.connect().await.context("BLE connect")?;
+            peripheral
+                .discover_services()
+                .await
+                .context("discover_services")?;
 
-        let chars = peripheral.characteristics();
-        let fen_notify = pick(&chars, chessnut::FEN_NOTIFY_UUID, CharPropFlags::NOTIFY)
-            .ok_or_else(|| anyhow!("FEN notify characteristic not found"))?;
-        let cmd_notify = pick(&chars, chessnut::COMMAND_NOTIFY_UUID, CharPropFlags::NOTIFY)
-            .ok_or_else(|| anyhow!("command notify characteristic not found"))?;
-        let cmd_write = pick(&chars, chessnut::COMMAND_WRITE_UUID, CharPropFlags::WRITE)
-            .or_else(|| {
-                pick(
-                    &chars,
-                    chessnut::COMMAND_WRITE_UUID,
-                    CharPropFlags::WRITE_WITHOUT_RESPONSE,
+            let chars = peripheral.characteristics();
+            let fen_notify = pick(&chars, chessnut::FEN_NOTIFY_UUID, CharPropFlags::NOTIFY)
+                .ok_or_else(|| anyhow!("FEN notify characteristic not found"))?;
+            let cmd_notify = pick(&chars, chessnut::COMMAND_NOTIFY_UUID, CharPropFlags::NOTIFY)
+                .ok_or_else(|| anyhow!("command notify characteristic not found"))?;
+            let cmd_write = pick(&chars, chessnut::COMMAND_WRITE_UUID, CharPropFlags::WRITE)
+                .or_else(|| {
+                    pick(
+                        &chars,
+                        chessnut::COMMAND_WRITE_UUID,
+                        CharPropFlags::WRITE_WITHOUT_RESPONSE,
+                    )
+                })
+                .ok_or_else(|| anyhow!("command write characteristic not found"))?;
+
+            peripheral.subscribe(&fen_notify).await?;
+            peripheral.subscribe(&cmd_notify).await?;
+            // Subscribe before the handshake, but publish the task only after it
+            // succeeds. Failed setup must not leave a detached notification task.
+            let stream = peripheral
+                .notifications()
+                .await
+                .context("opening board notification stream")?;
+
+            // Send INIT and CONFIG so the board starts streaming.
+            peripheral
+                .write(&cmd_write, &chessnut::INIT_COMMAND, WriteType::WithResponse)
+                .await
+                .context("write INIT_COMMAND")?;
+            peripheral
+                .write(
+                    &cmd_write,
+                    &chessnut::CONFIG_COMMAND,
+                    WriteType::WithResponse,
                 )
-            })
-            .ok_or_else(|| anyhow!("command write characteristic not found"))?;
+                .await
+                .context("write CONFIG_COMMAND")?;
+            Ok::<_, anyhow::Error>((cmd_write, stream))
+        })
+        .await
+        .context("timed out initialising the board")
+        .and_then(|result| result);
 
-        peripheral.subscribe(&fen_notify).await?;
-        peripheral.subscribe(&cmd_notify).await?;
-
-        // Spawn the notification listener.
-        let notif_tx = self.notifications.clone();
-        let state_arc = self.state.clone();
-        let p_clone = peripheral.clone();
-        tokio::spawn(async move {
-            let mut stream = match p_clone.notifications().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error=?e, "could not get notification stream");
-                    return;
-                }
-            };
-            while let Some(n) = stream.next().await {
-                let kind = if n.uuid == chessnut::FEN_NOTIFY_UUID {
-                    let mut st = state_arc.lock().await;
-                    st.last_fen_notification = Some(n.value.clone());
-                    st.last_heard = Some(Instant::now());
-                    BoardEvent::Fen(n.value)
-                } else if n.uuid == chessnut::COMMAND_NOTIFY_UUID {
-                    let mut st = state_arc.lock().await;
-                    st.last_heard = Some(Instant::now());
-                    BoardEvent::Cmd(n.value)
-                } else {
-                    tracing::debug!(uuid=%n.uuid, "notification on unknown characteristic, dropping");
-                    continue;
+        let (cmd_write, stream) = match setup {
+            Ok(ready) => ready,
+            Err(primary) => {
+                let cleanup = tokio::time::timeout(Duration::from_secs(5), peripheral.disconnect())
+                    .await
+                    .context("timed out disconnecting after failed board setup")
+                    .and_then(|result| result.context("disconnecting after failed board setup"));
+                return match cleanup {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(SetupFailure { primary, cleanup }.into()),
                 };
-                // Receivers may all have disconnected; that's fine.
-                let _ = notif_tx.send(kind);
             }
-            // The stream ending is the earliest notice we get that the board
-            // is gone. Tear the connection down here rather than waiting for
-            // the health check, and tell the clients so they stop trusting the
-            // position they are holding.
-            tracing::warn!("BLE notification stream ended; dropping the connection");
-            {
-                let mut st = state_arc.lock().await;
-                st.peripheral = None;
-                st.address = None;
-                st.name = None;
-                st.command_write = None;
-                st.last_fen_notification = None;
-                st.last_heard = None;
-            }
-            let _ = notif_tx.send(BoardEvent::Disconnected);
-        });
-
-        // Send INIT and CONFIG so the board starts streaming.
-        peripheral
-            .write(&cmd_write, &chessnut::INIT_COMMAND, WriteType::WithResponse)
-            .await
-            .context("write INIT_COMMAND")?;
-        peripheral
-            .write(&cmd_write, &chessnut::CONFIG_COMMAND, WriteType::WithResponse)
-            .await
-            .context("write CONFIG_COMMAND")?;
+        };
 
         let mut st = self.state.lock().await;
+        st.clear();
         st.peripheral = Some(peripheral);
         st.address = Some(addr.to_string());
         st.name = name.clone();
         st.command_write = Some(cmd_write);
         st.last_heard = Some(Instant::now());
+        let session = st.session.clone();
+        st.notification_tasks.spawn(forward_board_notifications(
+            stream,
+            self.state.clone(),
+            self.notifications.clone(),
+            session,
+        ));
 
         Ok((addr.to_string(), name))
     }
 
     pub async fn disconnect(&self) -> Result<()> {
+        let _connection = self.connection_lock.lock().await;
         let mut st = self.state.lock().await;
         let had_peripheral = st.peripheral.is_some();
         if let Some(p) = st.peripheral.take() {
@@ -285,11 +274,7 @@ impl Ble {
             // caller, which on the auto-connect path is the recovery loop.
             let _ = tokio::time::timeout(Duration::from_secs(5), p.disconnect()).await;
         }
-        st.address = None;
-        st.name = None;
-        st.command_write = None;
-        st.last_fen_notification = None;
-        st.last_heard = None;
+        st.clear();
         drop(st);
         if had_peripheral {
             let _ = self.notifications.send(BoardEvent::Disconnected);
@@ -314,9 +299,12 @@ impl Ble {
         };
         // A wedged CoreBluetooth can leave this pending forever, and the
         // bridge is waiting on the other end of the socket.
-        tokio::time::timeout(Duration::from_secs(10), peripheral.write(cwrite, data, wtype))
-            .await
-            .map_err(|_| anyhow!("timed out writing to the board"))??;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            peripheral.write(cwrite, data, wtype),
+        )
+        .await
+        .map_err(|_| anyhow!("timed out writing to the board"))??;
         Ok(())
     }
 
@@ -345,7 +333,7 @@ impl Ble {
         tokio::spawn(async move {
             // When the stack (not merely the board) has been unwell since.
             let mut unwell_since: Option<Instant> = None;
-            let mut note = |unwell: &mut Option<Instant>, bad: bool| {
+            let note = |unwell: &mut Option<Instant>, bad: bool| {
                 if bad {
                     unwell.get_or_insert_with(Instant::now);
                 } else {
@@ -368,26 +356,24 @@ impl Ble {
                         let silent_for = last_heard.map(|t| t.elapsed());
                         let silent = silent_for.map(|d| d > SILENCE_LIMIT).unwrap_or(true);
 
-                        let alive = match tokio::time::timeout(
-                            Duration::from_secs(5),
-                            p.is_connected(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(v)) => v,
-                            Ok(Err(e)) => {
-                                tracing::warn!(error=?e, "auto-connect: is_connected failed");
-                                false
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    "auto-connect: is_connected did not answer within 5s; \
+                        let alive =
+                            match tokio::time::timeout(Duration::from_secs(5), p.is_connected())
+                                .await
+                            {
+                                Ok(Ok(v)) => v,
+                                Ok(Err(e)) => {
+                                    tracing::warn!(error=?e, "auto-connect: is_connected failed");
+                                    false
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "auto-connect: is_connected did not answer within 5s; \
                                      treating the link as dead"
-                                );
-                                note(&mut unwell_since, true);
-                                false
-                            }
-                        };
+                                    );
+                                    note(&mut unwell_since, true);
+                                    false
+                                }
+                            };
 
                         if silent || !alive {
                             tracing::warn!(
@@ -401,12 +387,12 @@ impl Ble {
                         }
                     }
                     None => {
-                        match tokio::time::timeout(CONNECT_LIMIT, me.connect(None)).await {
-                            Ok(Ok((addr, name))) => {
+                        match me.connect(None).await {
+                            Ok((addr, name)) => {
                                 tracing::info!(addr=%addr, name=?name, "auto-connect: connected");
                                 note(&mut unwell_since, false);
                             }
-                            Ok(Err(e)) => {
+                            Err(e) => {
                                 // No board in range is the normal state of an
                                 // idle desk, not a sick Bluetooth stack.
                                 let benign = e.to_string().contains(NO_BOARD);
@@ -416,13 +402,6 @@ impl Ble {
                                     tracing::warn!(error=?e, "auto-connect: connect failed");
                                 }
                                 note(&mut unwell_since, !benign);
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    "auto-connect: connect did not finish within {:?}",
-                                    CONNECT_LIMIT
-                                );
-                                note(&mut unwell_since, true);
                             }
                         }
                     }
@@ -451,9 +430,193 @@ impl Ble {
     }
 }
 
-fn pick(chars: &std::collections::BTreeSet<Characteristic>, uuid: Uuid, prop: CharPropFlags) -> Option<Characteristic> {
+struct BoardDiscovery {
+    adapter: Adapter,
+    address: Option<String>,
+}
+
+impl scan::ScanBackend for BoardDiscovery {
+    type Id = PeripheralId;
+    type Match = ScanMatch;
+
+    async fn events(&self) -> Result<scan::Events<PeripheralId>> {
+        let events = Central::events(&self.adapter).await?;
+        Ok(Box::pin(events.filter_map(|event| async move {
+            match event {
+                CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) => Some(id),
+                _ => None,
+            }
+        })))
+    }
+
+    async fn start(&self) -> Result<()> {
+        self.adapter
+            .start_scan(ScanFilter {
+                local_name_contains: Some(chessnut::NAME_PREFIX.to_owned()),
+                ..ScanFilter::default()
+            })
+            .await
+            .context("starting Chessnut discovery")
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.adapter
+            .stop_scan()
+            .await
+            .context("stopping Chessnut discovery")
+    }
+
+    async fn matching(&self, id: PeripheralId) -> Result<Option<ScanMatch>> {
+        let peripheral = match self.adapter.peripheral(&id).await {
+            Ok(peripheral) => peripheral,
+            Err(btleplug::Error::DeviceNotFound) => return Ok(None),
+            Err(error) => return Err(error).context("reading discovered peripheral"),
+        };
+        let Some(properties) = peripheral.properties().await? else {
+            return Ok(None);
+        };
+        if !properties
+            .local_name
+            .as_deref()
+            .is_some_and(|name| name.contains(chessnut::NAME_PREFIX))
+        {
+            return Ok(None);
+        }
+        if self.address.as_deref().is_some_and(|address| {
+            !peripheral
+                .address()
+                .to_string()
+                .eq_ignore_ascii_case(address)
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(ScanMatch {
+            address: peripheral.address().to_string(),
+            name: properties.local_name,
+            peripheral,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct SetupFailure {
+    primary: anyhow::Error,
+    cleanup: anyhow::Error,
+}
+
+impl std::fmt::Display for SetupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "board setup failed: {:#}; cleanup also failed: {:#}",
+            self.primary, self.cleanup
+        )
+    }
+}
+
+impl std::error::Error for SetupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+async fn forward_board_notifications(
+    mut stream: Pin<Box<dyn Stream<Item = ValueNotification> + Send>>,
+    state: Arc<Mutex<State>>,
+    notifications: broadcast::Sender<BoardEvent>,
+    session: Arc<()>,
+) {
+    while let Some(n) = stream.next().await {
+        let mut st = state.lock().await;
+        if !Arc::ptr_eq(&st.session, &session) {
+            return;
+        }
+        let event = if n.uuid == chessnut::FEN_NOTIFY_UUID {
+            st.last_fen_notification = Some(n.value.clone());
+            BoardEvent::Fen(n.value)
+        } else if n.uuid == chessnut::COMMAND_NOTIFY_UUID {
+            BoardEvent::Cmd(n.value)
+        } else {
+            continue;
+        };
+        st.last_heard = Some(Instant::now());
+        let _ = notifications.send(event);
+    }
+    let mut st = state.lock().await;
+    if Arc::ptr_eq(&st.session, &session) {
+        tracing::warn!("BLE notification stream ended; dropping the connection");
+        st.clear();
+        let _ = notifications.send(BoardEvent::Disconnected);
+    }
+}
+
+fn pick(
+    chars: &std::collections::BTreeSet<Characteristic>,
+    uuid: Uuid,
+    prop: CharPropFlags,
+) -> Option<Characteristic> {
     chars
         .iter()
         .find(|c| c.uuid == uuid && c.properties.contains(prop))
         .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn old_notification_stream_cannot_overwrite_or_clear_a_new_session() {
+        let old = Arc::new(());
+        let state = Arc::new(Mutex::new(State {
+            address: Some("current board".into()),
+            last_fen_notification: Some(vec![42]),
+            ..State::default()
+        }));
+        let (notifications, mut events) = broadcast::channel(4);
+        let stream = futures::stream::iter([ValueNotification {
+            uuid: chessnut::FEN_NOTIFY_UUID,
+            value: vec![0],
+        }]);
+        forward_board_notifications(
+            Box::pin(stream),
+            state.clone(),
+            notifications.clone(),
+            old.clone(),
+        )
+        .await;
+        forward_board_notifications(
+            Box::pin(futures::stream::empty()),
+            state.clone(),
+            notifications,
+            old,
+        )
+        .await;
+        let st = state.lock().await;
+        assert_eq!(st.address.as_deref(), Some("current board"));
+        assert_eq!(st.last_fen_notification, Some(vec![42]));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn clearing_a_connection_releases_its_pending_notification_task() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let held = Arc::new(());
+        let weak = Arc::downgrade(&held);
+        {
+            let mut st = state.lock().await;
+            st.notification_tasks.spawn(async move {
+                let _held = held;
+                futures::future::pending::<()>().await;
+            });
+            st.clear();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect must release the old notification task");
+    }
 }

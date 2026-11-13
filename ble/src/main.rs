@@ -15,6 +15,7 @@
 
 mod ble;
 mod chessnut;
+mod scan;
 mod wire;
 
 use anyhow::{Context, Result};
@@ -34,15 +35,18 @@ use crate::wire::{DeviceInfo, Event, Op};
 #[command(name = "relay-rook-ble", about)]
 struct Args {
     /// Unix socket path to listen on.
-    #[arg(long, env = "RELAY_ROOK_BLE_SOCKET",
-          default_value = "/tmp/relay-rook-ble.sock")]
+    #[arg(
+        long,
+        env = "RELAY_ROOK_BLE_SOCKET",
+        default_value = "/tmp/relay-rook-ble.sock"
+    )]
     socket: PathBuf,
 }
 
 /// Shared handle: `None` until BLE init succeeds, then `Some(Arc<Ble>)`.
 type BleSlot = Arc<Mutex<Option<Arc<Ble>>>>;
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -172,9 +176,7 @@ fn spawn_ble_init(slot: BleSlot) {
                     arc_b.start_autoconnect();
                     let mut g = slot.lock().await;
                     *g = Some(arc_b);
-                    tracing::info!(
-                        "BLE adapter ready; auto-connect loop is now scanning."
-                    );
+                    tracing::info!("BLE adapter ready; auto-connect loop is now scanning.");
                     return;
                 }
                 Err(e) => {
@@ -209,14 +211,17 @@ async fn handle_client(stream: UnixStream, slot: BleSlot) -> Result<()> {
         slot_guard.as_ref().map(|b| b.notifications.subscribe())
     };
     let writer_for_notif = writer.clone();
-    let notif_task = if let Some(rx) = notif_handle {
-        Some(tokio::spawn(forward_notifications(rx, writer_for_notif)))
+    // JoinSet aborts its children on every exit path, including read/write
+    // errors. Dropping a bare JoinHandle would leave a detached subscriber.
+    let mut notif_tasks = tokio::task::JoinSet::new();
+    if let Some(rx) = notif_handle {
+        notif_tasks.spawn(forward_notifications(rx, writer_for_notif));
     } else {
         // Spawn a deferred subscriber: poll the slot until it's ready,
         // then forward.
         let slot2 = slot.clone();
         let writer2 = writer.clone();
-        Some(tokio::spawn(async move {
+        notif_tasks.spawn(async move {
             loop {
                 let rx = {
                     let g = slot2.lock().await;
@@ -228,7 +233,7 @@ async fn handle_client(stream: UnixStream, slot: BleSlot) -> Result<()> {
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-        }))
+        });
     };
 
     while let Some(line) = reader.next_line().await? {
@@ -245,9 +250,6 @@ async fn handle_client(stream: UnixStream, slot: BleSlot) -> Result<()> {
         send(&writer, event).await?;
     }
 
-    if let Some(t) = notif_task {
-        t.abort();
-    }
     Ok(())
 }
 
@@ -270,19 +272,30 @@ async fn dispatch(op: Op, slot: &BleSlot) -> Event {
 
     match op {
         Op::Connect { address } => match ble.connect(address).await {
-            Ok((addr, name)) => Event::Connected { address: addr, name },
-            Err(e) => Event::Error { message: format!("{e:#}") },
+            Ok((addr, name)) => Event::Connected {
+                address: addr,
+                name,
+            },
+            Err(e) => Event::Error {
+                message: format!("{e:#}"),
+            },
         },
         Op::Disconnect => match ble.disconnect().await {
             Ok(()) => Event::Disconnected,
-            Err(e) => Event::Error { message: format!("{e:#}") },
+            Err(e) => Event::Error {
+                message: format!("{e:#}"),
+            },
         },
         Op::Write { data } => match B64.decode(&data) {
             Ok(bytes) => match ble.write_command(&bytes).await {
                 Ok(()) => Event::Ack,
-                Err(e) => Event::Error { message: format!("{e:#}") },
+                Err(e) => Event::Error {
+                    message: format!("{e:#}"),
+                },
             },
-            Err(e) => Event::Error { message: format!("base64: {e}") },
+            Err(e) => Event::Error {
+                message: format!("base64: {e}"),
+            },
         },
         Op::LatestFen => Event::LatestFen {
             data: ble.last_fen().await.map(|b| B64.encode(b)),
@@ -301,7 +314,9 @@ async fn dispatch(op: Op, slot: &BleSlot) -> Event {
                     })
                     .collect(),
             },
-            Err(e) => Event::Error { message: format!("{e:#}") },
+            Err(e) => Event::Error {
+                message: format!("{e:#}"),
+            },
         },
     }
 }
@@ -345,4 +360,25 @@ async fn send(
     let mut w = writer.lock().await;
     w.write_all(line.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_client_frame_releases_its_deferred_notification_task() {
+        let slot: BleSlot = Arc::new(Mutex::new(None));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_client(server, slot.clone()));
+        client.write_all(&[0xff, b'\n']).await.unwrap();
+        assert!(task.await.unwrap().is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&slot) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a failed client must not leave a subscriber holding the BLE slot");
+    }
 }

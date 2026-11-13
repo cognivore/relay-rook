@@ -131,8 +131,6 @@ dependencies = [
 [[package]]
 name = "btleplug"
 version = "0.11.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9a11621cb2c8c024e444734292482b1ad86fb50ded066cf46252e46643c8748"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -695,6 +693,8 @@ dependencies = [
  "btleplug",
  "clap",
  "futures",
+ "objc2",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "tokio",
